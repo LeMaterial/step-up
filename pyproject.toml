@@ -1,13 +1,28 @@
 [project]
 name = "step-up"
 version = "0.1.0"
-description = "Add your description here"
+description = "Benchmark for 2D to 3D molecular conformer generation models"
 readme = "README.md"
 authors = [
-    { name = "Siddharth Betala", email = "betalas5@gmail.com" }
+    { name = "Siddharth Betala", email = "betalas5@gmail.com" },
+    { name = "Jacob Toney", email = "jwt@mit.edu" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "pyyaml>=6.0",
+    "rdkit>=2024.3.3",
+    "tensorboard>=2.16",
+    "torch>=2.1",
+    "torch-geometric>=2.3",
+    "torchmetrics>=1.0",
+    "tqdm>=4.66",
+    "transformers>=4.43",
+]
+
+[project.scripts]
+step-up = "step_up.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.10.8,<0.11.0"]
@@ -38,3 +53,19 @@ max-complexity = 12
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu124" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+

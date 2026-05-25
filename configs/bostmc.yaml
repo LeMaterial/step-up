@@ -1,0 +1,28 @@
+# Full BOSTMC-low-spin training run (~140K complexes, singlets + doublets, full d-block). GPU-only; staged for Slurm.
+# DESIGN DECISION (flagged in plan file):
+#   - `charge` and `spinmult` columns are currently IGNORED.
+#   - Recommendation for first publishable run: pre-filter to singlets-only (spinmult == 1) for the cleanest comparison to tmQMg. The CSVMoleculeDataset does not yet expose a filter knob, add one when this config is first run.
+#   - Follow-up: condition the model on (charge, spinmult) as a global feature.
+dataset_path: /home/gridsan/jtoney/BOSTMC/datasets/BOSTMC-low-spin.csv
+dataset_source: mol2
+subset_size: null
+split_ratios: [0.9, 0.05, 0.05]
+split_seed: 0
+
+n_layers: 8
+d_model: 512
+d_ffn: 1024
+n_head: 8
+dropout: 0.0
+
+epochs: 20
+batch_size: 100
+eval_batch_size: 100
+lr: 9.0e-5
+weight_decay: 0.0
+warmup_ratio: 0.1
+num_workers: 4
+
+device: cuda
+output_dir: outputs/bostmc_full
+seed: 0

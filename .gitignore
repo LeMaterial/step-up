@@ -206,6 +206,10 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# step-up training artifacts and local data
+outputs/
+data/processed/
+
 # PyPI configuration file
 .pypirc
 

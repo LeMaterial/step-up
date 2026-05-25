@@ -1,0 +1,25 @@
+# BOSTMC smoke run on a 100-molecule subset. Verifies the direct MOL2 parser
+# end-to-end (no RDKit) plus the LJ patch on d-block elements.
+dataset_path: /home/gridsan/jtoney/BOSTMC/datasets/BOSTMC-low-spin.csv
+dataset_source: mol2
+subset_size: 100
+split_ratios: [0.8, 0.1, 0.1]
+split_seed: 0
+
+n_layers: 2
+d_model: 64
+d_ffn: 128
+n_head: 4
+dropout: 0.0
+
+epochs: 3
+batch_size: 4
+eval_batch_size: 4
+lr: 3.0e-4
+weight_decay: 0.0
+warmup_ratio: 0.1
+num_workers: 0
+
+device: cpu
+output_dir: outputs/bostmc_smoke
+seed: 0

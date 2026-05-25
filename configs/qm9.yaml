@@ -1,0 +1,26 @@
+# Full QM9-full.csv training run (~134K molecules).
+# GPU-only, staged for the Slurm job once compute is available.
+# Mirrors ReBind's QM9 hyperparams from external/ReBIND/experiments/conformer_prediction/rebind.sh.
+dataset_path: /home/gridsan/jtoney/ElemNet/benchmarking/datasets/QM9-full.csv
+dataset_source: smiles
+subset_size: null
+split_ratios: [0.9, 0.05, 0.05]
+split_seed: 0
+
+n_layers: 8
+d_model: 512
+d_ffn: 1024
+n_head: 8
+dropout: 0.0
+
+epochs: 20
+batch_size: 100
+eval_batch_size: 100
+lr: 9.0e-5
+weight_decay: 0.0
+warmup_ratio: 0.1
+num_workers: 4
+
+device: cuda
+output_dir: outputs/qm9_full
+seed: 0
