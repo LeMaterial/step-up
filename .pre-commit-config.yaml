@@ -1,3 +1,5 @@
+exclude: ^external/
+
 repos:
   - repo: local
     hooks:
