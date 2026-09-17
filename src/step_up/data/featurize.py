@@ -28,29 +28,45 @@ from rdkit.Chem import rdDetermineBonds
 from .mol2 import mol2_to_graph_dict
 
 # Load ReBind's `data/utils.py` directly so we share the canonical featurization
-# without putting the entire ReBIND tree on sys.path. The submodule lives at
-# step-up/external/ReBIND/data/utils.py.
+# without putting the entire ReBIND tree on sys.path. The load is deferred until
+# the first featurization call so importing this module never fails on a fresh
+# checkout that hasn't initialized the submodule yet — `pytest` test collection
+# stays clean, and the missing-submodule error gets raised with an actionable
+# message only when someone actually tries to featurize a molecule.
 _REBIND_ROOT = Path(__file__).resolve().parents[3] / "external" / "ReBIND"
+_REBIND_UTILS_PATH = _REBIND_ROOT / "data" / "utils.py"
+
+_rebind_utils: Any = None
 
 
-def _load_rebind_data_utils():
-    path = _REBIND_ROOT / "data" / "utils.py"
-    if not path.exists():
+def _load_rebind_data_utils() -> Any:
+    global _rebind_utils
+    if _rebind_utils is not None:
+        return _rebind_utils
+    if not _REBIND_UTILS_PATH.exists():
         raise FileNotFoundError(
-            f"ReBind submodule not found at {_REBIND_ROOT}. "
+            f"ReBind submodule files missing at {_REBIND_UTILS_PATH}. "
             "Run: git submodule update --init --recursive"
         )
-    spec = importlib.util.spec_from_file_location("_step_up_rebind_data_utils", str(path))
+    spec = importlib.util.spec_from_file_location(
+        "_step_up_rebind_data_utils", str(_REBIND_UTILS_PATH)
+    )
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     sys.modules["_step_up_rebind_data_utils"] = mod
     spec.loader.exec_module(mod)
+    _rebind_utils = mod
     return mod
 
 
-_rebind_utils = _load_rebind_data_utils()
-mol_to_graph_dict = _rebind_utils.mol_to_graph_dict
-ALLOWABLE_FEATURES = _rebind_utils.ALLOWABLE_FEATURES
+def mol_to_graph_dict(mol: Chem.Mol) -> dict[str, Any]:
+    """Thin wrapper around ReBind's canonical ``data.utils.mol_to_graph_dict``."""
+    return _load_rebind_data_utils().mol_to_graph_dict(mol)
+
+
+def get_allowable_features() -> dict[str, Any]:
+    """Expose ReBind's ``ALLOWABLE_FEATURES`` table on demand."""
+    return _load_rebind_data_utils().ALLOWABLE_FEATURES
 
 
 def parse_xyz_block(block: str) -> tuple[list[str], np.ndarray]:

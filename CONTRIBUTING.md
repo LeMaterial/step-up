@@ -4,13 +4,16 @@ Thanks for helping improve `step-up`.
 
 ## Development Setup
 
-Clone the repository and install dependencies:
+Clone the repository (with `--recursive`, so the vendored ReBind submodule under
+`external/ReBIND` is checked out) and install dependencies:
 
 ```bash
-git clone https://github.com/LeMaterial/step-up.git
+git clone --recursive https://github.com/LeMaterial/step-up.git
 cd step-up
 uv sync --dev
 ```
+
+If you already cloned without `--recursive`, run `git submodule update --init --recursive`.
 
 Install the pre-commit hook:
 

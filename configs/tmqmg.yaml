@@ -1,7 +1,9 @@
 # Full tmQMg-full.csv training run (~60K organometallic complexes, closed-shell singlets, full d-block + La). GPU-only; staged for Slurm.
-dataset_path: /home/gridsan/jtoney/ElemNet/benchmarking/datasets/tmQMg-full.csv
+dataset_path: /home/gridsan/jtoney/ElemeNet-benchmarking/benchmarking/datasets/tmQMg-full.csv
 dataset_source: mol2
 subset_size: null
+# Split key: the tmQMg id (CSD refcode).
+id_column: id
 split_ratios: [0.9, 0.05, 0.05]
 split_seed: 0
 

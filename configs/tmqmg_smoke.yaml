@@ -1,8 +1,11 @@
 # Same shape as qm9_smoke, but reading the MOL2 path on organometallic data.
 # Verifies the LJ patch and the MOL2 → graph pipeline end-to-end on CPU.
-dataset_path: /home/gridsan/jtoney/ElemNet/benchmarking/datasets/tmQMg-full.csv
+dataset_path: /home/gridsan/jtoney/ElemeNet-benchmarking/benchmarking/datasets/tmQMg-full.csv
 dataset_source: mol2
 subset_size: 100
+# Split key: the tmQMg id (CSD refcode).
+id_column: id
+cache_dataset: true
 split_ratios: [0.8, 0.1, 0.1]
 split_seed: 0
 
