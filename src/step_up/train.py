@@ -1,9 +1,10 @@
 """Config-driven training loop for step-up.
 
 The loop is deliberately minimal: it owns dataset construction, the ReBind
-model, AdamW + linear-warmup, periodic validation, best-checkpoint saving, and
-TensorBoard logging. No HuggingFace Trainer, no accelerate — keeping the
-control flow legible while we're still iterating on the model.
+model, AdamW with linear warmup and cosine decay, periodic validation,
+best-checkpoint saving, and TensorBoard logging. No HuggingFace Trainer, no
+accelerate — keeping the control flow legible while we're still iterating on
+the model.
 """
 
 from __future__ import annotations
@@ -22,8 +23,8 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from .data.csv_dataset import CSVMoleculeDataset
-from .data.splits import random_split
-from .models.rebind import Collator, build_rebind
+from .data.splits import stable_split
+from .models.rebind import build_rebind, get_collator
 
 # ---------------------------------------------------------------------------
 # Config dataclasses
@@ -37,6 +38,22 @@ class TrainConfig:
     subset_size: int | None = None
     split_ratios: tuple[float, float, float] = (0.8, 0.1, 0.1)
     split_seed: int = 0
+    # Column with a stable per-molecule ID (e.g. `refcode`). Each molecule's split
+    # is a hash of this key and `split_seed` (see `stable_split`); without it the
+    # key is the CSV row number.
+    id_column: str | None = None
+    # Optional CSV column filter (e.g. `filter_column: spinmult, filter_value: 1`
+    # to restrict BOSTMC to singlets).
+    filter_column: str | None = None
+    filter_value: Any = None
+    # Featurize every row up front and drop the ones that fail. Disable only for
+    # datasets known to be clean; a bad row then raises mid-training instead.
+    validate_dataset: bool = True
+    # Keep featurized graph dicts in memory instead of re-featurizing every epoch.
+    # Trades memory for speed; recommended for smoke runs.
+    cache_dataset: bool = False
+    # Fail validation if more than this fraction of rows are dropped.
+    max_drop_fraction: float = 0.5
 
     # Model
     n_layers: int = 8
@@ -112,11 +129,17 @@ def _all_params_finite(model: torch.nn.Module) -> bool:
     return True
 
 
-def _linear_warmup_lr(step: int, total_steps: int, warmup_steps: int, base_lr: float) -> float:
+def _warmup_cosine_lr(step: int, total_steps: int, warmup_steps: int, base_lr: float) -> float:
     if step < warmup_steps:
         return base_lr * (step + 1) / max(warmup_steps, 1)
     progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def _mean_or_nan(total: float, count: int) -> float:
+    # NaN rather than 0.0 when nothing was averaged: a 0.0 D-MAE would read as a
+    # perfect score and win best-checkpoint selection.
+    return total / count if count else math.nan
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +165,8 @@ def _run_epoch(
     (no backward, no optimizer step). The first occurrence prints whether the
     badness is in the input batch or appeared inside the forward pass — useful
     to distinguish data corruption from model-side numerical instability.
+    During evaluation, non-finite batches are excluded from the means with a
+    warning. If no batch contributes, both means are NaN.
     """
     is_train = optimizer is not None
     model.train(is_train)
@@ -150,7 +175,7 @@ def _run_epoch(
     for batch in pbar:
         batch = _move_batch_to_device(batch, device)
         if is_train:
-            lr_now = _linear_warmup_lr(scheduler_state["step"], total_steps, warmup_steps, base_lr)
+            lr_now = _warmup_cosine_lr(scheduler_state["step"], total_steps, warmup_steps, base_lr)
             for g in optimizer.param_groups:
                 g["lr"] = lr_now
             optimizer.zero_grad(set_to_none=True)
@@ -223,12 +248,13 @@ def _run_epoch(
             with torch.no_grad():
                 out = model(**batch)
             if not torch.isfinite(out.loss):
+                print("WARN: non-finite loss on an evaluation batch; excluded from metrics.")
                 continue
         loss_sum += float(out.loss.detach())
         dmae_sum += float(out.cdist_mae.detach())
         n += 1
         pbar.set_postfix(loss=f"{loss_sum / n:.4f}", dmae=f"{dmae_sum / n:.4f}")
-    return loss_sum / max(n, 1), dmae_sum / max(n, 1)
+    return _mean_or_nan(loss_sum, n), _mean_or_nan(dmae_sum, n)
 
 
 def train(config: TrainConfig) -> dict[str, Any]:
@@ -243,11 +269,27 @@ def train(config: TrainConfig) -> dict[str, Any]:
         path=config.dataset_path,
         source=config.dataset_source,  # type: ignore[arg-type]
         subset_size=config.subset_size,
+        validate=config.validate_dataset,
+        max_drop_fraction=config.max_drop_fraction,
+        filter_column=config.filter_column,
+        filter_value=config.filter_value,
+        cache=config.cache_dataset,
+        id_column=config.id_column,
     )
-    train_set, val_set, test_set = random_split(
-        dataset, ratios=config.split_ratios, seed=config.split_seed
+    train_set, val_set, test_set = stable_split(
+        dataset, dataset.split_keys(), ratios=config.split_ratios, seed=config.split_seed
     )
-    collator = Collator()
+    print(
+        f"[split] train={len(train_set)} val={len(val_set)} test={len(test_set)} "
+        f"(keyed on {config.id_column or 'CSV row number'}, seed={config.split_seed})",
+        flush=True,
+    )
+    if len(train_set) == 0 or len(val_set) == 0:
+        raise ValueError(
+            f"Empty train or val split from {len(dataset)} molecules with "
+            f"split_ratios={config.split_ratios}. Use more data or larger ratios."
+        )
+    collator = get_collator()()
 
     def _make_loader(subset: Subset, batch_size: int, shuffle: bool) -> DataLoader:
         return DataLoader(
@@ -274,14 +316,14 @@ def train(config: TrainConfig) -> dict[str, Any]:
         model.parameters(), lr=config.lr, weight_decay=config.weight_decay
     )
 
-    steps_per_epoch = max(len(train_loader), 1)
-    total_steps = steps_per_epoch * config.epochs
+    total_steps = len(train_loader) * config.epochs
     warmup_steps = int(total_steps * config.warmup_ratio)
 
     writer = SummaryWriter(out_dir / "tb")
     scheduler_state: dict[str, int] = {"step": 0}
     history: list[dict[str, float]] = []
-    best_val = float("inf")
+    best_val = math.inf
+    best_epoch: int | None = None
     t0 = time.time()
     for epoch in range(1, config.epochs + 1):
         train_loss, train_dmae = _run_epoch(
@@ -326,12 +368,44 @@ def train(config: TrainConfig) -> dict[str, Any]:
                 "val_dmae": val_dmae,
             }
         )
-        if val_dmae < best_val:
-            best_val = val_dmae
+        if math.isfinite(val_dmae) and val_dmae < best_val:
+            best_val, best_epoch = val_dmae, epoch
             torch.save(model.state_dict(), out_dir / "best.pt")
     writer.close()
 
     with open(out_dir / "history.json", "w") as f:
         json.dump(history, f, indent=2)
-    del test_set  # held out; first round does not evaluate on test
-    return {"history": history, "best_val_dmae": best_val}
+    if best_epoch is None:
+        raise RuntimeError(
+            "No epoch produced a finite validation D-MAE, so no checkpoint was saved. "
+            f"Per-epoch metrics are in {out_dir / 'history.json'}."
+        )
+
+    # ------------------------------------------------------------------
+    # Test-set evaluation on this run's best checkpoint (selected by val D-MAE).
+    # ------------------------------------------------------------------
+    test_metrics: dict[str, float] = {}
+    if len(test_set) == 0:
+        print("WARN: test split is empty; skipping test evaluation.", flush=True)
+    else:
+        model.load_state_dict(torch.load(out_dir / "best.pt", map_location=config.device))
+        test_loader = _make_loader(test_set, config.eval_batch_size, shuffle=False)
+        test_loss, test_dmae = _run_epoch(
+            model,
+            test_loader,
+            None,
+            config.device,
+            scheduler_state,
+            config.lr,
+            total_steps,
+            warmup_steps,
+        )
+        test_metrics = {"test_loss": test_loss, "test_dmae": test_dmae}
+        with open(out_dir / "test_metrics.json", "w") as f:
+            json.dump({**test_metrics, "best_epoch": best_epoch}, f, indent=2)
+        print(
+            f"[test] test_loss={test_loss:.4f} test_dmae={test_dmae:.4f} "
+            f"(checkpoint from epoch {best_epoch})"
+        )
+
+    return {"history": history, "best_val_dmae": best_val, "best_epoch": best_epoch, **test_metrics}

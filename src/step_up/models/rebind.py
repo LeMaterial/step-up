@@ -1,10 +1,17 @@
 """Thin wrapper around the vendored ReBind implementation.
 
-Vendored at ``external/ReBIND``. We add that path to ``sys.path`` once on
-import so the vendor's intra-package relative imports work. We also patch
-``get_sigma_and_epsilon`` so that atomic numbers > 36 (i.e., second-row+
-transition metals, lanthanides, etc.) don't raise a KeyError on the
-organometallic datasets.
+Vendored at ``external/ReBIND``. Nothing is imported from the submodule until
+``build_rebind()`` or ``get_collator()`` is first called. At that point its root
+is put on ``sys.path`` (so the vendor's intra-package imports work) and three
+runtime patches are applied:
+
+- ``get_sigma_and_epsilon`` falls back to default LJ parameters for atomic
+  numbers > 36 (4d/5d transition metals, lanthanides, etc.) instead of raising
+  a KeyError on the organometallic datasets.
+- ``Encoder.forward`` / ``Decoder.forward`` add the Laplacian positional
+  encoding out of place, so the model can be trained in fp32.
+- ``REBIND.forward`` clamps predicted distances in the LJ block and scrubs
+  non-finite values from the rewired adjacencies.
 
 This is the explicit "hybrid: vendor for now, refactor later" handoff. The next
 iteration will copy the model code into ``step_up.models.rebind`` natively and
@@ -20,23 +27,74 @@ from typing import Any
 import torch
 
 _REBIND_ROOT = Path(__file__).resolve().parents[3] / "external" / "ReBIND"
-if not _REBIND_ROOT.exists():
-    raise FileNotFoundError(
-        f"ReBind submodule not found at {_REBIND_ROOT}. "
-        "Run: git submodule update --init --recursive"
-    )
+# Concrete-file probe: a fresh git checkout without `--recursive` leaves
+# `external/ReBIND/` as an empty directory, so `exists()` on the root passes
+# but later imports fail with a confusing ModuleNotFoundError. Check for an
+# actual vendored file so the error message is actionable.
+_REBIND_PROBE = _REBIND_ROOT / "models" / "rebind" / "modeling_rebind.py"
 
-# Put the vendor root on sys.path so its internal imports (`from .modules ...`,
-# `from models import ...`) resolve. Idempotent.
-if str(_REBIND_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REBIND_ROOT))
 
-from models import REBIND, Collator, REBINDConfig  # noqa: E402
-from models.modules import utils as _rebind_utils  # noqa: E402
-from models.rebind import collating_rebind as _rebind_collating  # noqa: E402
-from models.rebind import modeling_rebind as _rebind_modeling  # noqa: E402
+def _ensure_rebind_on_path() -> None:
+    """Verify the submodule is initialized and put its root on ``sys.path``.
 
-__all__ = ["REBIND", "Collator", "REBINDConfig", "build_rebind", "patch_lj_parameters"]
+    Raises ``FileNotFoundError`` with an actionable message if the submodule
+    files aren't present. Idempotent.
+    """
+    if not _REBIND_PROBE.exists():
+        raise FileNotFoundError(
+            f"ReBind submodule files missing at {_REBIND_PROBE}. "
+            "Run: git submodule update --init --recursive"
+        )
+    if str(_REBIND_ROOT) not in sys.path:
+        sys.path.insert(0, str(_REBIND_ROOT))
+
+
+# Cached references to the vendored symbols, populated by ``_load_rebind()``.
+# Private so that importing them directly fails instead of silently yielding
+# ``None`` before the submodule is loaded; use ``build_rebind`` / ``get_collator``.
+_REBIND: Any = None
+_Collator: Any = None
+_REBINDConfig: Any = None
+_rebind_utils: Any = None
+_rebind_collating: Any = None
+_rebind_modeling: Any = None
+
+# Upstream ``forward`` methods replaced by the patches below, keyed by class, so
+# tests can check the patched model against upstream.
+_UPSTREAM_FORWARDS: dict[type, Any] = {}
+
+__all__ = ["build_rebind", "get_collator"]
+
+
+def _load_rebind() -> None:
+    """Import the vendored ReBind modules and apply the runtime patches.
+
+    Deferred until first use so that importing ``step_up.models.rebind`` from a
+    fresh checkout (without ``--recursive``) doesn't fail at collection time.
+    Idempotent.
+    """
+    global _REBIND, _Collator, _REBINDConfig
+    global _rebind_utils, _rebind_collating, _rebind_modeling
+    if _REBIND is not None:
+        return
+    _ensure_rebind_on_path()
+    # Imports are deferred so the vendored sys.path entry exists first.
+    from models import REBIND, Collator, REBINDConfig
+    from models.modules import utils
+    from models.rebind import collating_rebind, modeling_rebind
+
+    _REBIND = REBIND
+    _Collator = Collator
+    _REBINDConfig = REBINDConfig
+    _rebind_utils = utils
+    _rebind_collating = collating_rebind
+    _rebind_modeling = modeling_rebind
+
+    # Apply the three runtime patches we need (defined further down). They
+    # depend on the vendored modules above so we can only call them now.
+    patch_lj_parameters()
+    patch_inplace_lap_addition()
+    patch_rebind_forward()
 
 
 # ---------------------------------------------------------------------------
@@ -143,9 +201,12 @@ def _canonical_lj_table() -> dict[int, dict[str, float]]:
 def _patched_encoder_forward(self, **inputs):
     """Out-of-place equivalent of ``Encoder.forward`` from vendored ReBind.
 
-    The vendored version did an in-place slice-assignment of the Laplacian
-    positional encoding into ``node_embedding``, which breaks autograd on
-    modern PyTorch (>=2.6). We replace it with a zero-padded add.
+    Upstream adds the Laplacian positional encoding into ``node_embedding`` with
+    an in-place slice assignment. In the decoder, that write modifies the encoder
+    output after ``conformer_head`` has saved it for backward, so fp32 training
+    fails with autograd's "modified by an inplace operation" error. (Upstream
+    trains under fp16 autocast, where the error doesn't trigger.) The encoder's
+    own write is harmless, but both blocks use a zero-padded add for symmetry.
     """
     node_attr = inputs.get("node_attr")
     node_embedding = self.node_embedding(node_attr)
@@ -194,6 +255,8 @@ def patch_inplace_lap_addition() -> None:
     """Replace ``Encoder.forward`` and ``Decoder.forward`` with autograd-safe versions."""
     if getattr(_rebind_modeling, "_step_up_inplace_patched", False):
         return
+    _UPSTREAM_FORWARDS[_rebind_modeling.Encoder] = _rebind_modeling.Encoder.forward
+    _UPSTREAM_FORWARDS[_rebind_modeling.Decoder] = _rebind_modeling.Decoder.forward
     _rebind_modeling.Encoder.forward = _patched_encoder_forward
     _rebind_modeling.Decoder.forward = _patched_decoder_forward
     _rebind_modeling._step_up_inplace_patched = True
@@ -241,7 +304,21 @@ def _patched_rebind_forward(self, **inputs):
     # CHANGE (1): clamp_min on the predicted distance matrix.
     D_cache = torch.cdist(conformer_cache, conformer_cache).detach().clamp_min(_LJ_D_MIN)
     D_M = _rebind_modeling.make_cdist_mask(node_mask)
-    inputs["pred_conformation"] = node_embedding
+    # NOTE: The variable name ``pred_conformation`` is misleading — this is
+    # ReBind's intentional design (see vendored ``modeling_rebind.py``). The
+    # residual head treats ``hidden_X`` (decoder output) and ``conformer_base``
+    # (this tensor) as two **hidden states** of identical shape
+    # ``(B, N, d_model)``, stacks them along a new last dim, computes an
+    # attention score across the two channels, and projects the weighted sum
+    # back to coordinates. It is NOT the predicted coordinate tensor
+    # ``conformer_cache`` (shape ``(B, N, 3)``); using ``conformer_cache`` here
+    # would crash on the ``torch.stack`` shape mismatch.
+    #
+    # Upstream stores the encoder output here, and its decoder then adds the
+    # Laplacian positional encoding to that same tensor in place, so upstream's
+    # residual head actually receives ``encoder output + PE``. The out-of-place
+    # decoder patch no longer mutates it, so the PE is added explicitly here.
+    inputs["pred_conformation"] = _add_lap_out_of_place(node_embedding, inputs["lap_eigenvectors"])
     inputs["node_embedding"] = node_embedding
 
     sigma, epsilon = inputs.get("sigma"), inputs.get("epsilon")
@@ -300,14 +377,23 @@ def patch_rebind_forward() -> None:
     """Replace ``REBIND.forward`` with the numerically-defensive version."""
     if getattr(_rebind_modeling, "_step_up_forward_patched", False):
         return
+    _UPSTREAM_FORWARDS[_rebind_modeling.REBIND] = _rebind_modeling.REBIND.forward
     _rebind_modeling.REBIND.forward = _patched_rebind_forward
     _rebind_modeling._step_up_forward_patched = True
 
 
-# Apply patches eagerly on import.
-patch_lj_parameters()
-patch_inplace_lap_addition()
-patch_rebind_forward()
+# NOTE: patches are no longer applied at module import. ``_load_rebind()``
+# applies them on first use (i.e. when ``build_rebind()`` or a ``Collator``
+# instance is requested via the lazy accessors below). This lets test
+# collection succeed on a fresh checkout where the submodule isn't initialized
+# yet — the missing-submodule error fires only when someone actually tries to
+# build the model.
+
+
+def get_collator():
+    """Return the (lazily loaded) ReBind ``Collator`` class."""
+    _load_rebind()
+    return _Collator
 
 
 def build_rebind(
@@ -317,9 +403,10 @@ def build_rebind(
     n_head: int = 8,
     atom_vocab_size: int = 513,
     dropout: float = 0.0,
-) -> REBIND:
+):
     """Instantiate a REBIND model from a flat keyword-style config."""
-    config = REBINDConfig(
+    _load_rebind()
+    config = _REBINDConfig(
         n_encode_layers=n_layers,
         n_decode_layers=n_layers,
         embed_style="atom_type_ids",
@@ -338,4 +425,4 @@ def build_rebind(
         dropout=dropout,
         d_ffn=d_ffn,
     )
-    return REBIND(config)
+    return _REBIND(config)

@@ -48,16 +48,29 @@ uv run step-up train -c configs/bostmc_smoke.yaml   # ~6 min (larger complexes)
 
 ## Production Training
 
-Three full-scale configs are staged. They target GPU (`device: cuda`) and use
-ReBind's published QM9 hyperparameters (8 encoder + 8 decoder layers,
-d_model=512, lr=9e-5, AdamW, batch 100 for QM9 / 32 for organometallics,
-20 epochs by default).
+Three full-scale configs are staged. They target GPU (`device: cuda`) and follow
+ReBind's published QM9 setup for the architecture and main optimizer settings
+(8 encoder + 8 decoder layers, d_model=512, AdamW, lr=9e-5, 10% warmup, gradient
+clipping at 1.0, batch 100, 20 epochs by default). The training loop differs from
+ReBind's script in three ways: the learning rate decays on a cosine schedule after
+warmup (ReBind: linear), AdamW keeps PyTorch's default beta2=0.999 (ReBind: 0.99),
+and training runs in fp32 (ReBind: fp16 mixed precision).
 
 | Config | Dataset | Rows | Notes |
 |---|---|---|---|
 | `configs/qm9.yaml` | QM9-full.csv | ~134K | Sanity baseline on organic systems |
-| `configs/tmqmg.yaml` | tmQMg-full.csv | ~60K | Singlets, full d-block + La |
-| `configs/bostmc.yaml` | BOSTMC-low-spin.csv | ~140K | Singlets + doublets, full d-block |
+| `configs/tmqmg.yaml` | tmQMg-full.csv | ~58K | Singlets, full d-block + La |
+| `configs/bostmc.yaml` | BOSTMC-low-spin.csv | ~93K of ~121K | Singlets only (`spinmult == 1`), full d-block |
+
+The BOSTMC config trains on singlets only: the model isn't conditioned on charge
+or spin, so mixing spin states would make comparisons ambiguous. Doublets need
+that conditioning first.
+
+Train/val/test membership is a hash of each molecule's ID (`id_column`, e.g.
+`refcode`, or the CSV row number if unset) and `split_seed`. A molecule
+therefore stays in the same split regardless of `subset_size`, filtering, or
+which rows fail featurization, so different runs and models are scored on the
+same test molecules. Split sizes match `split_ratios` approximately.
 
 To dry-run a config (validates the YAML and dataset path without training):
 
@@ -66,15 +79,17 @@ uv run step-up train -c configs/qm9.yaml --dry-run
 ```
 
 ```bash
-sbatch scripts/train.slurm configs/qm9.yaml
-sbatch scripts/train.slurm configs/tmqmg.yaml
-sbatch scripts/train.slurm configs/bostmc.yaml
+sbatch scripts/train.sh configs/qm9.yaml
+sbatch scripts/train.sh configs/tmqmg.yaml
+sbatch scripts/train.sh configs/bostmc.yaml
 ```
 
-The Slurm script (1) initializes the submodule, (2) runs `uv sync --dev`, and
-(3) launches `uv run step-up train -c <config>`. Each run writes its config,
-TensorBoard logs, and best checkpoint (by val D-MAE) to the `output_dir`
-specified in the config. default is `outputs/<dataset>_full/`.
+The Slurm script lives at [scripts/train.sh](scripts/train.sh). It (1)
+initializes the submodule, (2) runs `uv sync --dev`, and (3) launches
+`uv run step-up train -c <config>`. Each run writes its config, TensorBoard
+logs, per-epoch history, best checkpoint (by val D-MAE), and the test-set
+metrics of that checkpoint (`test_metrics.json`) to the `output_dir` specified
+in the config — default is `outputs/<dataset>_full/`.
 
 ### Adjusting training duration
 
@@ -98,21 +113,21 @@ budget in the Slurm header.
 ```
 src/step_up/
 |-- data/
-|   |-- csv_dataset.py    # streaming CSV --> graph-dict dataset
+|   |-- csv_dataset.py    # CSV --> graph-dict dataset
 |   |-- featurize.py      # XYZ path (RDKit DetermineBonds for QM9)
 |   |-- mol2.py           # direct MOL2 parser (no RDKit, used for organometallics)
-|   |-- splits.py
+|   |-- splits.py         # hash-based, stable train/val/test splits
 |-- models/
 |   |-- rebind.py         # thin wrapper over external/ReBIND + 3 runtime patches
-|   eval/
+|-- eval/
 |   |-- metrics.py        # D-MAE, D-RMSE, coord-RMSD, per-element D-MAE
 |-- train.py              # config-driven training loop
 |-- cli.py                # `uv run step-up train -c <yaml>`
 
 configs/           # per-dataset YAML configs (smoke + full)
 external/ReBIND/   # git submodule, vendored upstream ReBind
-scripts/train.slurm
-tests/             # 9 tests covering imports, dataset loading, forward pass, metrics
+scripts/train.sh   # Slurm job script (sbatch scripts/train.sh <config>)
+tests/             # imports, dataset loading, MOL2 parsing, forward pass, metrics
 ```
 
 ## Data Path Notes

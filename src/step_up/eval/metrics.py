@@ -54,21 +54,39 @@ def per_element_dmae(
 ) -> dict[int, float]:
     """Per-element D-MAE: |d_ij_pred - d_ij_true| averaged over pairs touching Z.
 
-    ``atomic_numbers`` is ``(B, N)`` of integer Z values (use 0 for padding).
-    Returns a dict mapping Z -> mean |Δd| over pairs (i,j) with i or j of that
-    element (each pair contributes to both endpoint elements).
+    ``atomic_numbers`` is ``(B, N)`` of **true atomic numbers** (1 for H, 6 for
+    C, etc.). Padding positions are identified via ``node_mask`` (1 = valid,
+    0 = padding) — *not* via a sentinel atomic-number value.
+
+    ReBind uses two encodings, so check which one you have:
+
+    - A collated batch's ``node_type`` is already true atomic numbers (the
+      collator adds 1, with 0 at padding). Pass it directly.
+    - A single graph dict's ``node_type`` is ``Z - 1`` (H is 0). Add 1 first.
+
+    Raises ``ValueError`` if a non-padding atom has atomic number < 1, which
+    catches ``Z - 1`` indices passed by mistake whenever hydrogen is present.
+
+    Returns a dict mapping Z -> mean |Δd| over pairs (i, j) with i or j of
+    that element (each pair contributes to both endpoint elements).
     """
     mask = _pair_mask(node_mask)
     diff = (torch.cdist(pred, pred) - torch.cdist(target, target)).abs() * mask
+    valid = node_mask.to(torch.bool)
 
     zs = atomic_numbers.to(torch.long)
+    if (zs[valid] < 1).any():
+        raise ValueError(
+            "atomic_numbers must be true atomic numbers (H = 1), but a non-padding atom "
+            "has Z < 1. Graph-dict node_type is Z - 1; add 1 before calling."
+        )
     per_z: dict[int, float] = {}
-    for z in torch.unique(zs):
-        if int(z.item()) == 0:
-            continue
-        # Pairs where either endpoint has atomic number z.
-        endpoint_mask = (zs == z).unsqueeze(-1) | (zs == z).unsqueeze(-2)
-        pair_mask = mask * endpoint_mask.to(torch.float32)
+    for z in torch.unique(zs[valid]):
+        z_int = int(z.item())
+        # Pairs where either endpoint is a valid atom of element z.
+        endpoint = ((zs == z) & valid).to(torch.float32)
+        endpoint_mask = (endpoint.unsqueeze(-1) + endpoint.unsqueeze(-2)).clamp_max(1.0)
+        pair_mask = mask * endpoint_mask
         denom = pair_mask.sum().clamp_min(1)
-        per_z[int(z.item())] = float((diff * endpoint_mask.to(torch.float32)).sum() / denom)
+        per_z[z_int] = float((diff * endpoint_mask).sum() / denom)
     return per_z

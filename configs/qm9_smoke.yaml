@@ -1,8 +1,11 @@
 # Smallest possible run that exercises the full pipeline on CPU.
 # Goal: prove the loss strictly decreases. Numbers are not meaningful.
-dataset_path: /home/gridsan/jtoney/ElemNet/benchmarking/datasets/QM9-full.csv
+dataset_path: /home/gridsan/jtoney/ElemeNet-benchmarking/benchmarking/datasets/QM9-full.csv
 dataset_source: smiles
 subset_size: 100
+# Split key: mol_id, so QM9's few duplicated rows always share a split.
+id_column: mol_id
+cache_dataset: true
 split_ratios: [0.8, 0.1, 0.1]
 split_seed: 0
 
