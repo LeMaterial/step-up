@@ -1,13 +1,30 @@
 [project]
 name = "step-up"
 version = "0.1.0"
-description = "Add your description here"
+description = "Benchmark for 2D to 3D molecular conformer generation models"
 readme = "README.md"
 authors = [
-    { name = "Siddharth Betala", email = "betalas5@gmail.com" }
+    { name = "Siddharth Betala", email = "betalas5@gmail.com" },
+    { name = "Jacob Toney", email = "jwt@mit.edu" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "pyyaml>=6.0",
+    "rdkit>=2024.3.3",
+    "tensorboard>=2.16",
+    # Upper bound keeps every platform on the same torch as the cluster: the cu124 index
+    # (see [tool.uv.sources]) has no builds past 2.6, while PyPI would resolve the latest.
+    "torch>=2.6,<2.7",
+    "torch-geometric>=2.3",
+    "torchmetrics>=1.0",
+    "tqdm>=4.66",
+    "transformers>=4.43",
+]
+
+[project.scripts]
+step-up = "step_up.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.10.8,<0.11.0"]
@@ -38,3 +55,24 @@ max-complexity = 12
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]
+
+[tool.uv.sources]
+# CUDA-12.4 torch wheels are only published for Linux x86_64. On macOS / other
+# platforms we fall back to the default PyPI index, which provides CPU wheels.
+# This keeps `uv sync --dev` working on contributor laptops and CI runners.
+torch = [
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+

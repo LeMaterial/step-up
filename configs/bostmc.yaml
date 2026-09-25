@@ -1,0 +1,32 @@
+# Full BOSTMC training run, restricted to closed-shell singlets so the metric
+# comparison against tmQMg (singlets only) is clean and the model isn't asked
+# to predict geometries from two spin manifolds at once. Doublet support is a
+# follow-up that requires conditioning the model on (charge, spinmult) as a
+# global feature.
+dataset_path: /home/gridsan/jtoney/BOSTMC/datasets/filtered/BOSTMC-low-spin.csv
+dataset_source: mol2
+subset_size: null
+filter_column: spinmult
+filter_value: 1
+# Split key: refcode.
+id_column: refcode
+split_ratios: [0.9, 0.05, 0.05]
+split_seed: 0
+
+n_layers: 8
+d_model: 512
+d_ffn: 1024
+n_head: 8
+dropout: 0.0
+
+epochs: 20
+batch_size: 100
+eval_batch_size: 100
+lr: 9.0e-5
+weight_decay: 0.0
+warmup_ratio: 0.1
+num_workers: 4
+
+device: cuda
+output_dir: outputs/bostmc_full
+seed: 0
