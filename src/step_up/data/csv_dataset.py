@@ -21,10 +21,16 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pandas as pd
+from rdkit import Chem
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from .featurize import featurize_mol2_xyz, featurize_xyz
+from .featurize import (
+    featurize_mol2_xyz,
+    featurize_molblock,
+    featurize_xyz,
+    mol_from_xyz_block,
+)
 
 # Embedded XYZ/MOL2 fields blow past the default csv.field_size_limit. Raise it
 # once at import time so pandas (which uses Python's csv internally for the C
@@ -38,6 +44,18 @@ class DatasetSpec:
 
     path: Path
     source: Literal["smiles", "mol2"]
+
+
+def _read_token_file(path: Path) -> dict[str, list[int]]:
+    """Read ``id,input_ids`` rows into a mapping of id to per-atom token ids."""
+    frame = pd.read_csv(path)
+    missing = {"id", "input_ids"} - set(frame.columns)
+    if missing:
+        raise ValueError(f"token file {path} is missing columns: {sorted(missing)}")
+    return {
+        str(key): [int(v) for v in str(ids).split()]
+        for key, ids in zip(frame["id"], frame["input_ids"], strict=True)
+    }
 
 
 def _read_csv_subset(path: Path, columns: Sequence[str], nrows: int | None) -> pd.DataFrame:
@@ -57,9 +75,11 @@ class CSVMoleculeDataset(Dataset):
     path
         Path to the CSV.
     source
-        Either ``"smiles"`` (QM9-style: featurize from the ``xyz`` column via
-        RDKit ``DetermineBonds``) or ``"mol2"`` (organometallic: featurize from
-        the ``mol2`` column directly via the in-house parser).
+        One of ``"smiles"`` (QM9-style: featurize from the ``xyz`` column via
+        RDKit ``DetermineBonds``), ``"mol2"`` (organometallic: featurize from
+        the ``mol2`` column directly via the in-house parser), or ``"sdf"``
+        (featurize an SDF record held in the ``sdf`` column, keeping its own
+        bonds and coordinates).
     subset_size
         Optional cap on the number of CSV rows to load (the first rows of the
         file). Useful for smoke runs.
@@ -89,12 +109,26 @@ class CSVMoleculeDataset(Dataset):
         used as the split key by :meth:`split_keys`. Rows sharing an ID always
         land in the same split. Without it, a row's key is its row number in
         the CSV.
+    token_file
+        Optional CSV of ``id,input_ids`` (space-separated per-atom token ids,
+        see ``scripts/tokenize_molebert.py``), joined on ``id_column``. GTMGC's
+        published conformer models embed Mole-BERT tokenizer ids rather than
+        atom types, so their batches need this.
+    split_column
+        Optional column holding a published split name per row (``train`` /
+        ``val`` / ``test``), read by :meth:`split_labels`. Use it to reproduce
+        someone else's split instead of hashing one.
+    charge_column, spin_column
+        Optional columns holding the molecule's formal charge (electrons) and
+        spin multiplicity. When given, each graph dict carries ``charge`` and
+        ``spin_multiplicity`` for the model's global conditioning. A missing
+        column means neutral / closed-shell.
     """
 
     def __init__(
         self,
         path: str | Path,
-        source: Literal["smiles", "mol2"],
+        source: Literal["smiles", "mol2", "sdf"],
         subset_size: int | None = None,
         validate: bool = True,
         max_drop_fraction: float = 0.5,
@@ -102,12 +136,25 @@ class CSVMoleculeDataset(Dataset):
         filter_value: Any = None,
         cache: bool = False,
         id_column: str | None = None,
+        split_column: str | None = None,
+        charge_column: str | None = None,
+        spin_column: str | None = None,
+        token_file: str | Path | None = None,
     ) -> None:
         self.path = Path(path)
         if not self.path.exists():
             raise FileNotFoundError(self.path)
         self.source = source
         self.id_column = id_column
+        self.split_column = split_column
+        self.charge_column = charge_column
+        self.spin_column = spin_column
+        self.token_file = Path(token_file) if token_file is not None else None
+        self._tokens: dict[str, list[int]] | None = None
+        if self.token_file is not None:
+            if id_column is None:
+                raise ValueError("token_file needs id_column to join the tokens on")
+            self._tokens = _read_token_file(self.token_file)
         self._cache_enabled = cache
         self._cache: dict[int, dict[str, Any]] = {}
 
@@ -115,9 +162,11 @@ class CSVMoleculeDataset(Dataset):
             cols = ["smiles", "xyz"]
         elif source == "mol2":
             cols = ["mol2", "xyz"]
+        elif source == "sdf":
+            cols = ["sdf"]
         else:
             raise ValueError(f"Unknown source: {source!r}")
-        for extra in (filter_column, id_column):
+        for extra in (filter_column, id_column, split_column, charge_column, spin_column):
             if extra is not None and extra not in cols:
                 cols.append(extra)
 
@@ -172,11 +221,56 @@ class CSVMoleculeDataset(Dataset):
             raise ValueError(f"id_column {self.id_column!r} has missing values in {self.path}")
         return ids.astype(str).tolist()
 
+    def rdkit_mol(self, idx: int):
+        """RDKit molecule for item ``idx``, atoms in the same order as its graph dict.
+
+        Available for the ``sdf`` and ``smiles`` sources. The MOL2 path never
+        builds an RDKit molecule, so it raises instead.
+        """
+        row = self._df.iloc[self._valid_indices[idx]]
+        if self.source == "sdf":
+            return Chem.MolFromMolBlock(str(row["sdf"]), removeHs=False)
+        if self.source == "smiles":
+            return mol_from_xyz_block(str(row["xyz"]))
+        raise NotImplementedError(f"source {self.source!r} does not go through RDKit")
+
+    def split_labels(self) -> list[str]:
+        """Published split name per row, aligned with dataset indices."""
+        if self.split_column is None:
+            raise ValueError("split_labels() needs split_column to be set")
+        labels = self._df.iloc[self._valid_indices][self.split_column]
+        if labels.isna().any():
+            raise ValueError(
+                f"split_column {self.split_column!r} has missing values in {self.path}"
+            )
+        return labels.astype(str).tolist()
+
     def _featurize(self, real_idx: int) -> dict[str, Any]:
         row = self._df.iloc[real_idx]
         if self.source == "smiles":
-            return featurize_xyz(str(row["xyz"]))
-        return featurize_mol2_xyz(str(row["mol2"]), str(row["xyz"]))
+            graph = featurize_xyz(str(row["xyz"]))
+        elif self.source == "sdf":
+            graph = featurize_molblock(str(row["sdf"]))
+        else:
+            graph = featurize_mol2_xyz(str(row["mol2"]), str(row["xyz"]))
+        # Molecule-level state for conditioning; the collator turns these into
+        # model inputs. Absent columns mean a neutral closed-shell molecule.
+        if self.charge_column is not None:
+            graph["charge"] = float(row[self.charge_column])
+        if self.spin_column is not None:
+            graph["spin_multiplicity"] = float(row[self.spin_column])
+        if self._tokens is not None:
+            key = str(row[self.id_column])
+            tokens = self._tokens.get(key)
+            if tokens is None:
+                raise KeyError(f"no Mole-BERT tokens for {key!r} in {self.token_file}")
+            if len(tokens) != graph["num_nodes"]:
+                raise ValueError(
+                    f"{key!r} has {len(tokens)} tokens for {graph['num_nodes']} atoms; "
+                    "the token file was built from a different featurization"
+                )
+            graph["input_ids"] = tokens
+        return graph
 
     def _validate_rows(self, max_drop_fraction: float) -> list[int]:
         n = len(self._df)

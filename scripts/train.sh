@@ -25,8 +25,14 @@ REPO_ROOT="$(git -C "${SLURM_SUBMIT_DIR:-$(dirname "$0")}" rev-parse --show-topl
 cd "$REPO_ROOT"
 
 # Make sure the submodule is initialized in case the job runs on a fresh checkout.
-git submodule update --init --recursive
+# Jobs launched together share this clone, and git's config lock is not safe against
+# concurrent writers (a second job dies with "could not lock config file"), so skip
+# the update once the submodule is populated and serialize the setup steps.
+SETUP_LOCK="$REPO_ROOT/.git/step-up-setup.lock"
+if [[ ! -f external/ReBIND/models/rebind/modeling_rebind.py ]]; then
+  flock "$SETUP_LOCK" git submodule update --init --recursive
+fi
 
-uv sync --dev
+flock "$SETUP_LOCK" uv sync --dev
 
 uv run step-up train -c "$CONFIG"

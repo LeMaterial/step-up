@@ -1,3 +1,6 @@
 [submodule "external/ReBIND"]
 	path = external/ReBIND
 	url = https://github.com/holymollyhao/ReBIND.git
+[submodule "external/GTMGC"]
+	path = external/GTMGC
+	url = https://github.com/Rich-XGK/GTMGC.git

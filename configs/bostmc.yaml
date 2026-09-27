@@ -1,17 +1,28 @@
-# Full BOSTMC training run, restricted to closed-shell singlets so the metric
-# comparison against tmQMg (singlets only) is clean and the model isn't asked
-# to predict geometries from two spin manifolds at once. Doublet support is a
-# follow-up that requires conditioning the model on (charge, spinmult) as a
-# global feature.
+# Full BOSTMC low-spin training run: singlets and doublets together (121,496
+# complexes), with the model conditioned on charge and spin so the two manifolds
+# are distinguishable.
+#
+# Data is the filtered release, which drops structures whose molecular graph
+# changed during optimization and deduplicates by initial graph hash, keeping the
+# best-R-factor representative.
+#
+# Split: the project's own random split (seed 0, 80/10/10 by refcode) from
+# datasets/filtered/splits/random, which covers all 121,496 low-spin rows. The
+# similarity ("spectral") split under splits/spectral is the planned follow-up.
 dataset_path: /home/gridsan/jtoney/BOSTMC/datasets/filtered/BOSTMC-low-spin.csv
 dataset_source: mol2
 subset_size: null
-filter_column: spinmult
-filter_value: 1
-# Split key: refcode.
 id_column: refcode
-split_ratios: [0.9, 0.05, 0.05]
-split_seed: 0
+split_files:
+  train: /home/gridsan/jtoney/BOSTMC/datasets/filtered/splits/random/train-random.csv
+  val: /home/gridsan/jtoney/BOSTMC/datasets/filtered/splits/random/val-random.csv
+  test: /home/gridsan/jtoney/BOSTMC/datasets/filtered/splits/random/test-random.csv
+
+# Charges span -8..+8 and spin multiplicity is 1 or 2. Both enter as scalars, so
+# rare charge states still inform the model and inference isn't restricted to the
+# combinations seen in training.
+charge_column: charge
+spin_column: spinmult
 
 n_layers: 8
 d_model: 512
@@ -19,14 +30,21 @@ d_ffn: 1024
 n_head: 8
 dropout: 0.0
 
+# Optimization as in ReBind's rebind.sh (see README for the fp16 exception).
 epochs: 20
 batch_size: 100
 eval_batch_size: 100
 lr: 9.0e-5
 weight_decay: 0.0
 warmup_ratio: 0.1
+adam_beta1: 0.9
+adam_beta2: 0.99
+adam_eps: 1.0e-8
+lr_schedule: linear
+grad_clip: 1.0
+drop_last: true
 num_workers: 4
 
 device: cuda
 output_dir: outputs/bostmc_full
-seed: 0
+seed: 42

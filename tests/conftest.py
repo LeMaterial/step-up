@@ -29,6 +29,26 @@ def qm9_path() -> Path:
 
 
 @pytest.fixture(scope="session")
+def qm9_sdf_path() -> Path:
+    """QM9 records in ReBind's published form: ``mol_id, split, sdf`` molblocks.
+
+    Five molecules copied from gdb9.sdf (the HuggingFace ``RichXuOvO/HFQm9``
+    copy that ReBind and GTMGC used), carrying their published split labels.
+    """
+    return _fixture("qm9_sdf_mini.csv")
+
+
+@pytest.fixture(scope="session")
+def qm9_sdf_tokens_path() -> Path:
+    """Mole-BERT token ids for the molecules in ``qm9_sdf_mini.csv``.
+
+    Committed so the GTMGC tests don't need the tokenizer checkpoint; regenerate
+    with ``scripts/tokenize_molebert.py``.
+    """
+    return _fixture("qm9_sdf_mini_molebert_tokens.csv")
+
+
+@pytest.fixture(scope="session")
 def tmqmg_path() -> Path:
     return _fixture("tmqmg_mini.csv")
 

@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
+import pytest
 import torch
 from torch.utils.data import DataLoader, Subset
 
 from step_up.data.csv_dataset import CSVMoleculeDataset
 from step_up.models import rebind
+from step_up.models.lj_params import UFF_LJ_PARAMETERS
 from step_up.models.rebind import build_rebind, get_collator
 
 
@@ -94,3 +99,45 @@ def test_lj_patch_supports_heavy_z(tmqmg_path) -> None:
     assert "sigma" in batch and "epsilon" in batch
     assert torch.isfinite(batch["sigma"]).all()
     assert torch.isfinite(batch["epsilon"]).all()
+
+    # Element-specific, not a flat fallback. The collator combines pairs
+    # (Lorentz-Berthelot), so each atom's own parameters sit on the diagonal.
+    node_mask = batch["node_mask"].bool()
+    seen = set()
+    for row in range(node_mask.shape[0]):
+        keep = node_mask[row]
+        node_types = batch["node_type"][row][keep].tolist()
+        sigmas = batch["sigma"][row][keep][:, keep].diagonal().tolist()
+        epsilons = batch["epsilon"][row][keep][:, keep].diagonal().tolist()
+        for node_type, sigma, epsilon in zip(node_types, sigmas, epsilons, strict=True):
+            # The collator shifts node_type by 1 so 0 can mean padding.
+            expected = UFF_LJ_PARAMETERS[int(node_type) - 1]
+            assert sigma == pytest.approx(expected[0], rel=1e-5)
+            assert epsilon == pytest.approx(expected[1], rel=1e-5)
+            seen.add(int(node_type))
+    assert max(seen) - 1 > 35, "the fixture should contain a metal beyond ReBind's own table"
+
+
+def test_uff_table_agrees_with_rebinds_own_values() -> None:
+    """Our table must extend upstream's, not restate it differently.
+
+    ReBind defines its parameters inside the function body, so we read them out
+    of the vendored source: over Z=1..36 the two tables have to match exactly, or
+    swapping ours in would quietly change the published QM9 setup.
+    """
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "external"
+        / "ReBIND"
+        / "models"
+        / "modules"
+        / "utils.py"
+    ).read_text()
+    start = source.index("lj_parameters = {")
+    end = source.index("\n    }", start) + len("\n    }")
+    upstream = ast.literal_eval(source[start + len("lj_parameters = ") : end])
+
+    assert upstream, "failed to parse ReBind's LJ table"
+    for node_type, params in upstream.items():
+        assert UFF_LJ_PARAMETERS[node_type] == (params["sigma"], params["epsilon"])
+    assert max(UFF_LJ_PARAMETERS) > max(upstream)

@@ -74,3 +74,34 @@ def test_train_fails_without_a_finite_validation_epoch(qm9_path, tmp_path, monke
         train(_tiny_config(qm9_path, tmp_path))
     assert not (tmp_path / "run" / "best.pt").exists()
     assert not (tmp_path / "run" / "test_metrics.json").exists()
+
+
+def test_lr_schedule_matches_the_paper_setting() -> None:
+    """`linear` is HuggingFace's warmup-then-decay, which ReBind's script requests."""
+    total, warmup, base = 100, 10, 9e-5
+    linear = [train_module._lr_at_step(s, total, warmup, base, "linear") for s in range(total + 1)]
+    assert linear[0] == 0.0
+    assert linear[warmup] == pytest.approx(base)
+    assert linear[warmup + (total - warmup) // 2] == pytest.approx(base / 2)
+    assert linear[total] == pytest.approx(0.0)
+    assert all(a >= b for a, b in zip(linear[warmup:], linear[warmup + 1 :], strict=False))
+
+    cosine = [train_module._lr_at_step(s, total, warmup, base, "cosine") for s in range(total + 1)]
+    assert cosine[warmup] == pytest.approx(base)
+    assert cosine[total] == pytest.approx(0.0, abs=1e-12)
+
+    # An unknown name is rejected at config load, and by the helper itself.
+    with pytest.raises(ValueError, match="Unknown lr_schedule"):
+        TrainConfig(dataset_path="x.csv", dataset_source="sdf", lr_schedule="triangular")
+    with pytest.raises(ValueError, match="Unknown lr_schedule"):
+        train_module._lr_at_step(warmup + 1, total, warmup, base, "triangular")
+
+
+def test_drop_last_keeps_a_partial_batch_rather_than_training_on_nothing(
+    qm9_path, tmp_path, capsys
+) -> None:
+    config = _tiny_config(qm9_path, tmp_path, batch_size=64, eval_batch_size=64)
+    assert config.drop_last, "ReBind's script drops the last partial batch"
+    result = train(config)
+    assert result["best_epoch"] == 1
+    assert "keeping the partial batch" in capsys.readouterr().out

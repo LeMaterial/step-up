@@ -7,6 +7,7 @@ import pytest
 
 from step_up.data import featurize
 from step_up.data.csv_dataset import CSVMoleculeDataset
+from step_up.data.splits import split_by_labels
 
 
 def _check_graph_dict(g: dict) -> None:
@@ -94,3 +95,21 @@ def test_split_keys_come_from_the_csv_not_dataset_positions(bostmc_path) -> None
         bostmc_path, "mol2", filter_column="spinmult", filter_value=2, id_column="refcode"
     )
     assert by_id.split_keys() == df.loc[doublet_rows, "refcode"].tolist()
+
+
+def test_sdf_source_uses_published_bonds_and_split(qm9_sdf_path) -> None:
+    """The sdf source featurizes molblocks and can read a published split column."""
+    ds = CSVMoleculeDataset(qm9_sdf_path, "sdf", id_column="mol_id", split_column="split")
+    df = pd.read_csv(qm9_sdf_path)
+    assert len(ds) == len(df)
+    for i in range(len(ds)):
+        _check_graph_dict(ds[i])
+    assert ds.split_keys() == df["mol_id"].tolist()
+    assert ds.split_labels() == df["split"].tolist()
+
+    train, val, test = split_by_labels(ds, ds.split_labels())
+    assert (len(train), len(val), len(test)) == (2, 2, 1)
+    # Methane from gdb9.sdf: 4 C-H bonds, stored as two directed edges each.
+    methane = ds[0]
+    assert methane["num_nodes"] == 5
+    assert methane["num_edges"] == 8

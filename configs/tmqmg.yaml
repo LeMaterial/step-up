@@ -1,11 +1,31 @@
-# Full tmQMg-full.csv training run (~60K organometallic complexes, closed-shell singlets, full d-block + La). GPU-only; staged for Slurm.
+# Full tmQMg training run (~58K organometallic complexes, closed-shell singlets,
+# full d-block + La). GPU-only; staged for Slurm.
+#
+# This copy of tmQMg is the original release minus the 2,390 IDs in the dataset's
+# outliers.txt (unphysical geometries the community flagged), so it is the cleaner
+# training set but NOT the data the published baselines used. See
+# configs/tmqmg_complete.yaml for the run that matches TMCgen exactly.
+#
+# Split: tmQMg's authors publish no canonical ML split, so we adopt TMCgen's
+# (Schaufelberger & Jorner, arXiv 2606.00666), whose paper also reports the GeoDiff
+# and ConfGF tmQMg baselines we will compare against. Their refcode lists live in
+# github.com/digital-chemistry-laboratory/TMCgen under data/raw/tmqmg. They cover
+# 58,086 of the rows here; the 2,379 they list that are missing are exactly the
+# removed outliers, 38 of which are in their test split. Rows in no list are dropped.
 dataset_path: /home/gridsan/jtoney/ElemeNet-benchmarking/benchmarking/datasets/tmQMg-full.csv
 dataset_source: mol2
 subset_size: null
-# Split key: the tmQMg id (CSD refcode).
 id_column: id
-split_ratios: [0.9, 0.05, 0.05]
-split_seed: 0
+split_files:
+  train: /home/gridsan/jtoney/step-up-data/tmqmg/complexes-train.txt
+  val: /home/gridsan/jtoney/step-up-data/tmqmg/complexes-val-split.txt
+  test: /home/gridsan/jtoney/step-up-data/tmqmg/complexes-test-split.txt
+
+# Charge runs -1 / 0 / +1 here. Every complex is a closed-shell singlet (no odd
+# electron counts), so the spin feature is constant, but the conditioning is kept
+# identical to BOSTMC so the two runs share an architecture.
+charge_column: charge
+spin_column: null
 
 n_layers: 8
 d_model: 512
@@ -13,14 +33,21 @@ d_ffn: 1024
 n_head: 8
 dropout: 0.0
 
+# Optimization as in ReBind's rebind.sh (see README for the fp16 exception).
 epochs: 20
 batch_size: 100
 eval_batch_size: 100
 lr: 9.0e-5
 weight_decay: 0.0
 warmup_ratio: 0.1
+adam_beta1: 0.9
+adam_beta2: 0.99
+adam_eps: 1.0e-8
+lr_schedule: linear
+grad_clip: 1.0
+drop_last: true
 num_workers: 4
 
 device: cuda
 output_dir: outputs/tmqmg_full
-seed: 0
+seed: 42

@@ -5,6 +5,8 @@ dataset_source: mol2
 subset_size: 100
 # Split key: the tmQMg id (CSD refcode).
 id_column: id
+charge_column: charge
+spin_column: null
 cache_dataset: true
 split_ratios: [0.8, 0.1, 0.1]
 split_seed: 0

@@ -129,6 +129,20 @@ def featurize_xyz(xyz_block: str, charge: int = 0) -> dict[str, Any]:
     return mol_to_graph_dict(mol)
 
 
+def featurize_molblock(molblock: str) -> dict[str, Any]:
+    """Featurize one SDF/MOL record (the QM9 path for ReBind's published data).
+
+    Bonds and coordinates are read from the record, so nothing is re-perceived
+    from geometry, and hydrogens stay explicit. Raises ``ValueError`` when RDKit
+    cannot parse or sanitize the record; the dataset's validation pass filters
+    those rows out (ReBind's own evaluation skips them too).
+    """
+    mol = Chem.MolFromMolBlock(molblock, removeHs=False)
+    if mol is None:
+        raise ValueError("RDKit failed to parse the molblock")
+    return mol_to_graph_dict(mol)
+
+
 def featurize_mol2_xyz(mol2_block: str, xyz_block: str) -> dict[str, Any]:
     """One-shot helper for MOL2-sourced rows (tmQMg, BOSTMC).
 

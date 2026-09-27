@@ -1,7 +1,7 @@
 """Config-driven training loop for step-up.
 
-The loop is deliberately minimal: it owns dataset construction, the ReBind
-model, AdamW with linear warmup and cosine decay, periodic validation,
+The loop is deliberately minimal: it owns dataset construction, the model
+(see step_up.models), AdamW with linear warmup and cosine decay, periodic validation,
 best-checkpoint saving, and TensorBoard logging. No HuggingFace Trainer, no
 accelerate — keeping the control flow legible while we're still iterating on
 the model.
@@ -23,8 +23,8 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from .data.csv_dataset import CSVMoleculeDataset
-from .data.splits import stable_split
-from .models.rebind import build_rebind, get_collator
+from .data.splits import split_by_id_files, split_by_labels, stable_split
+from .models import MODEL_NAMES, N_GLOBAL_FEATURES, build_model, build_model_collator
 
 # ---------------------------------------------------------------------------
 # Config dataclasses
@@ -34,7 +34,9 @@ from .models.rebind import build_rebind, get_collator
 @dataclass
 class TrainConfig:
     dataset_path: str
-    dataset_source: str  # "smiles" | "mol2"
+    dataset_source: str  # "smiles" | "mol2" | "sdf"
+    # Which benchmark model to train (see step_up.models.MODEL_NAMES).
+    model: str = "rebind"
     subset_size: int | None = None
     split_ratios: tuple[float, float, float] = (0.8, 0.1, 0.1)
     split_seed: int = 0
@@ -42,6 +44,21 @@ class TrainConfig:
     # is a hash of this key and `split_seed` (see `stable_split`); without it the
     # key is the CSV row number.
     id_column: str | None = None
+    # Column holding a published split name per row (train / val / test). When set,
+    # it replaces the hashed split, and `split_ratios` / `split_seed` are unused.
+    split_column: str | None = None
+    # Published split given as ID lists instead, e.g.
+    # `split_files: {train: train.txt, val: val.txt, test: test.txt}`. Needs
+    # `id_column`; rows listed in no file are dropped. Takes precedence over
+    # `split_column` and the hashed split.
+    split_files: dict[str, str] | None = None
+    # Columns holding the molecule's charge (electrons) and spin multiplicity.
+    # Setting either turns on the model's charge/spin conditioning.
+    charge_column: str | None = None
+    spin_column: str | None = None
+    # CSV of precomputed Mole-BERT token ids (`id,input_ids`), joined on `id_column`.
+    # GTMGC's published conformer models need it; ReBind does not.
+    token_file: str | None = None
     # Optional CSV column filter (e.g. `filter_column: spinmult, filter_value: 1`
     # to restrict BOSTMC to singlets).
     filter_column: str | None = None
@@ -69,6 +86,15 @@ class TrainConfig:
     lr: float = 9e-5
     weight_decay: float = 0.0
     warmup_ratio: float = 0.1
+    # AdamW moments. ReBind's script sets beta2=0.99; PyTorch's default is 0.999.
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.99
+    adam_eps: float = 1e-8
+    # "linear" reproduces ReBind's `--lr_scheduler_type=linear` (HuggingFace's linear
+    # warmup then linear decay to zero). "cosine" keeps the decay used before.
+    lr_schedule: str = "linear"
+    # ReBind passes `--dataloader_drop_last`, so the last partial training batch is skipped.
+    drop_last: bool = True
     # Global gradient-norm clip. ReBind's published training inherited
     # HuggingFace Trainer's default of 1.0; without it the 8-layer / d=512
     # model NaNs out in the first epoch on QM9.
@@ -84,6 +110,16 @@ class TrainConfig:
     output_dir: str = "outputs/run"
     seed: int = 0
     log_interval: int = 10
+
+    def __post_init__(self) -> None:
+        # Catch a typo here rather than partway into a run: the schedule name is
+        # only consulted once warmup ends.
+        if self.model not in MODEL_NAMES:
+            raise ValueError(f"Unknown model: {self.model!r} (expected one of {MODEL_NAMES})")
+        if self.lr_schedule not in ("linear", "cosine"):
+            raise ValueError(
+                f"Unknown lr_schedule: {self.lr_schedule!r} (expected 'linear' or 'cosine')"
+            )
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> TrainConfig:
@@ -129,11 +165,23 @@ def _all_params_finite(model: torch.nn.Module) -> bool:
     return True
 
 
-def _warmup_cosine_lr(step: int, total_steps: int, warmup_steps: int, base_lr: float) -> float:
+def _lr_at_step(
+    step: int, total_steps: int, warmup_steps: int, base_lr: float, schedule: str = "linear"
+) -> float:
+    """Learning rate at ``step``.
+
+    ``linear`` matches HuggingFace's ``get_linear_schedule_with_warmup``, which is
+    what ReBind's script requests: the rate ramps from 0 over the warmup and then
+    decays linearly to 0 at the last step.
+    """
     if step < warmup_steps:
-        return base_lr * (step + 1) / max(warmup_steps, 1)
+        return base_lr * step / max(warmup_steps, 1)
     progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+    if schedule == "linear":
+        return base_lr * max(0.0, 1.0 - progress)
+    if schedule == "cosine":
+        return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+    raise ValueError(f"Unknown lr_schedule: {schedule!r} (expected 'linear' or 'cosine')")
 
 
 def _mean_or_nan(total: float, count: int) -> float:
@@ -158,6 +206,7 @@ def _run_epoch(
     warmup_steps: int,
     grad_clip: float = 0.0,
     nan_skip_max: int = 0,
+    lr_schedule: str = "linear",
 ) -> tuple[float, float]:
     """Run one pass over ``loader``. Returns (mean_loss, mean_dmae).
 
@@ -175,7 +224,9 @@ def _run_epoch(
     for batch in pbar:
         batch = _move_batch_to_device(batch, device)
         if is_train:
-            lr_now = _warmup_cosine_lr(scheduler_state["step"], total_steps, warmup_steps, base_lr)
+            lr_now = _lr_at_step(
+                scheduler_state["step"], total_steps, warmup_steps, base_lr, lr_schedule
+            )
             for g in optimizer.param_groups:
                 g["lr"] = lr_now
             optimizer.zero_grad(set_to_none=True)
@@ -257,14 +308,11 @@ def _run_epoch(
     return _mean_or_nan(loss_sum, n), _mean_or_nan(dmae_sum, n)
 
 
-def train(config: TrainConfig) -> dict[str, Any]:
-    _set_seed(config.seed)
-    out_dir = Path(config.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    with open(out_dir / "config.json", "w") as f:
-        json.dump(config.__dict__, f, indent=2, default=str)
+def build_splits(config: TrainConfig) -> tuple[CSVMoleculeDataset, Subset, Subset, Subset]:
+    """Build the dataset and its train/val/test subsets, as training does.
 
-    # Data
+    Shared with ``step-up evaluate`` so both see identical splits.
+    """
     dataset = CSVMoleculeDataset(
         path=config.dataset_path,
         source=config.dataset_source,  # type: ignore[arg-type]
@@ -275,23 +323,58 @@ def train(config: TrainConfig) -> dict[str, Any]:
         filter_value=config.filter_value,
         cache=config.cache_dataset,
         id_column=config.id_column,
+        split_column=config.split_column,
+        charge_column=config.charge_column,
+        spin_column=config.spin_column,
+        token_file=config.token_file,
     )
-    train_set, val_set, test_set = stable_split(
-        dataset, dataset.split_keys(), ratios=config.split_ratios, seed=config.split_seed
-    )
+    if config.split_files:
+        if config.id_column is None:
+            raise ValueError("split_files needs id_column so rows can be matched to the lists")
+        train_set, val_set, test_set = split_by_id_files(
+            dataset, dataset.split_keys(), config.split_files
+        )
+        split_desc = f"published ID lists keyed on {config.id_column!r}"
+    elif config.split_column is not None:
+        train_set, val_set, test_set = split_by_labels(dataset, dataset.split_labels())
+        split_desc = f"published split from column {config.split_column!r}"
+    else:
+        train_set, val_set, test_set = stable_split(
+            dataset, dataset.split_keys(), ratios=config.split_ratios, seed=config.split_seed
+        )
+        split_desc = f"hashed on {config.id_column or 'CSV row number'}, seed={config.split_seed}"
     print(
-        f"[split] train={len(train_set)} val={len(val_set)} test={len(test_set)} "
-        f"(keyed on {config.id_column or 'CSV row number'}, seed={config.split_seed})",
+        f"[split] train={len(train_set)} val={len(val_set)} test={len(test_set)} ({split_desc})",
         flush=True,
     )
+    return dataset, train_set, val_set, test_set
+
+
+def train(config: TrainConfig) -> dict[str, Any]:
+    _set_seed(config.seed)
+    out_dir = Path(config.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "config.json", "w") as f:
+        json.dump(config.__dict__, f, indent=2, default=str)
+
+    dataset, train_set, val_set, test_set = build_splits(config)
     if len(train_set) == 0 or len(val_set) == 0:
         raise ValueError(
             f"Empty train or val split from {len(dataset)} molecules with "
             f"split_ratios={config.split_ratios}. Use more data or larger ratios."
         )
-    collator = get_collator()()
+    conditioned = config.charge_column is not None or config.spin_column is not None
+    if conditioned:
+        print(
+            f"[model] {config.model}: conditioning on molecule charge and unpaired-electron count "
+            f"(charge_column={config.charge_column!r}, spin_column={config.spin_column!r})",
+            flush=True,
+        )
+    collator = build_model_collator(config.model, conditioned=conditioned)
 
-    def _make_loader(subset: Subset, batch_size: int, shuffle: bool) -> DataLoader:
+    def _make_loader(
+        subset: Subset, batch_size: int, shuffle: bool, drop_last: bool = False
+    ) -> DataLoader:
         return DataLoader(
             subset,
             batch_size=batch_size,
@@ -299,21 +382,37 @@ def train(config: TrainConfig) -> dict[str, Any]:
             num_workers=config.num_workers,
             collate_fn=collator,
             persistent_workers=config.num_workers > 0,
+            drop_last=drop_last,
         )
 
-    train_loader = _make_loader(train_set, config.batch_size, shuffle=True)
+    train_loader = _make_loader(
+        train_set, config.batch_size, shuffle=True, drop_last=config.drop_last
+    )
+    if len(train_loader) == 0:
+        print(
+            f"WARN: drop_last would leave no training batches for {len(train_set)} molecules "
+            f"at batch_size={config.batch_size}; keeping the partial batch.",
+            flush=True,
+        )
+        train_loader = _make_loader(train_set, config.batch_size, shuffle=True)
     val_loader = _make_loader(val_set, config.eval_batch_size, shuffle=False)
 
     # Model + optimizer
-    model = build_rebind(
+    model = build_model(
+        config.model,
         n_layers=config.n_layers,
         d_model=config.d_model,
         d_ffn=config.d_ffn,
         n_head=config.n_head,
         dropout=config.dropout,
+        n_global_features=N_GLOBAL_FEATURES if conditioned else 0,
     ).to(config.device)
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=config.lr, weight_decay=config.weight_decay
+        model.parameters(),
+        lr=config.lr,
+        betas=(config.adam_beta1, config.adam_beta2),
+        eps=config.adam_eps,
+        weight_decay=config.weight_decay,
     )
 
     total_steps = len(train_loader) * config.epochs
@@ -337,6 +436,7 @@ def train(config: TrainConfig) -> dict[str, Any]:
             warmup_steps,
             grad_clip=config.grad_clip,
             nan_skip_max=config.nan_skip_max,
+            lr_schedule=config.lr_schedule,
         )
         val_loss, val_dmae = _run_epoch(
             model,

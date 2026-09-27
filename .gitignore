@@ -220,3 +220,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Slurm job logs (scripts/train.sh writes train-<jobid>.out into the submit dir)
+*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9].out
+slurm-*.out

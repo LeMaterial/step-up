@@ -5,9 +5,9 @@ Vendored at ``external/ReBIND``. Nothing is imported from the submodule until
 is put on ``sys.path`` (so the vendor's intra-package imports work) and three
 runtime patches are applied:
 
-- ``get_sigma_and_epsilon`` falls back to default LJ parameters for atomic
-  numbers > 36 (4d/5d transition metals, lanthanides, etc.) instead of raising
-  a KeyError on the organometallic datasets.
+- ``get_sigma_and_epsilon`` looks parameters up in the full UFF table
+  (:mod:`step_up.models.lj_params`) instead of raising a KeyError on any atomic
+  number above 36 — i.e. on most of the organometallic datasets.
 - ``Encoder.forward`` / ``Decoder.forward`` add the Laplacian positional
   encoding out of place, so the model can be trained in fp32.
 - ``REBIND.forward`` clamps predicted distances in the LJ block and scrubs
@@ -25,6 +25,15 @@ from pathlib import Path
 from typing import Any
 
 import torch
+
+from .common import (
+    N_GLOBAL_FEATURES,
+    GlobalConditionCollator,
+    add_lap_out_of_place,
+    apply_global_conditioning,
+    global_condition_mlp,
+)
+from .lj_params import MAX_NODE_TYPE, UFF_LJ_PARAMETERS
 
 _REBIND_ROOT = Path(__file__).resolve().parents[3] / "external" / "ReBIND"
 # Concrete-file probe: a fresh git checkout without `--recursive` leaves
@@ -63,7 +72,9 @@ _rebind_modeling: Any = None
 # tests can check the patched model against upstream.
 _UPSTREAM_FORWARDS: dict[type, Any] = {}
 
-__all__ = ["build_rebind", "get_collator"]
+_CONDITIONED_REBIND: Any = None
+
+__all__ = ["build_collator", "build_rebind", "get_collator"]
 
 
 def _load_rebind() -> None:
@@ -101,52 +112,40 @@ def _load_rebind() -> None:
 # LJ-parameter extension for organometallics.
 # ---------------------------------------------------------------------------
 # ReBind's `get_sigma_and_epsilon` hardcodes LJ parameters for atomic-number
-# indices 0..35 (i.e., Z=1..36, H through Kr). For organometallics that include
-# 4d, 5d, and f-block elements, we extend with a safe fallback. The values are
-# order-of-magnitude reasonable (UFF-style sigma ~3.5 A, epsilon ~0.05 kcal/mol); the
-# LJ rewiring's contribution is small relative to the bond-graph signal, and
-# physically realistic dispersion for metals is dominated by short-range
-# Pauli repulsion which the cutoff already handles.
-
-_DEFAULT_LJ_SIGMA = 3.5
-_DEFAULT_LJ_EPSILON = 0.05
+# indices 0..35 (i.e., Z=1..36, H through Kr), and KeyErrors on anything heavier.
+# We swap in the full UFF table, which agrees with theirs exactly over Z=1..36 —
+# so QM9 is untouched — and covers the 4d/5d metals, the lanthanides and iodine
+# that the organometallic sets are made of.
 
 
 def patch_lj_parameters() -> None:
-    """Replace ``get_sigma_and_epsilon`` with a Z-tolerant version.
+    """Replace ``get_sigma_and_epsilon`` with one that covers the whole table.
 
     Idempotent: calling twice has no effect beyond the first.
     """
     if getattr(_rebind_utils, "_step_up_patched", False):
         return
 
-    original_dict = {
-        i: {"sigma": _DEFAULT_LJ_SIGMA, "epsilon": _DEFAULT_LJ_EPSILON} for i in range(118)
-    }
-    # `lj_parameters` is defined inside `get_sigma_and_epsilon`. Re-read its
-    # canonical entries from a one-off call by inspecting the function's
-    # closure-free body: we just copy from a local clone here.
-    canonical = _canonical_lj_table()
-    original_dict.update(canonical)
-
     def patched_get_sigma_and_epsilon(
         mol_data: Any, drugs: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # `drugs` is upstream's switch for a differently keyed table; step-up
+        # never sets it, and `node_type` is always Z - 1 here.
+        del drugs
         eps_list: list[float] = []
         sig_list: list[float] = []
-        for i, atom_id in enumerate(mol_data.node_type):
-            if drugs:
-                # We don't use the `drugs` branch in step-up. Fall through to
-                # the index-based lookup, which assumes `node_type` is already
-                # Z-1.
-                pass
+        for atom_id in mol_data.node_type:
             idx = int(atom_id.item())
-            params = original_dict.get(
-                idx, {"sigma": _DEFAULT_LJ_SIGMA, "epsilon": _DEFAULT_LJ_EPSILON}
-            )
-            eps_list.append(params["epsilon"])
-            sig_list.append(params["sigma"])
-            del i
+            params = UFF_LJ_PARAMETERS.get(idx)
+            if params is None:
+                raise ValueError(
+                    f"No LJ parameters for node_type {idx} (Z={idx + 1}); the UFF table "
+                    f"stops at node_type {MAX_NODE_TYPE}. A larger value means the "
+                    "featurizer emitted a bad atomic number."
+                )
+            sigma, epsilon = params
+            eps_list.append(epsilon)
+            sig_list.append(sigma)
         return torch.tensor(eps_list), torch.tensor(sig_list)
 
     _rebind_utils.get_sigma_and_epsilon = patched_get_sigma_and_epsilon
@@ -156,46 +155,40 @@ def patch_lj_parameters() -> None:
     _rebind_utils._step_up_patched = True
 
 
-def _canonical_lj_table() -> dict[int, dict[str, float]]:
-    """Return ReBind's original Z=1..36 LJ parameter table (key = Z - 1)."""
-    return {
-        0: {"sigma": 2.886, "epsilon": 0.0440},
-        1: {"sigma": 2.362, "epsilon": 0.0560},
-        2: {"sigma": 2.451, "epsilon": 0.0250},
-        3: {"sigma": 2.745, "epsilon": 0.0850},
-        4: {"sigma": 3.637, "epsilon": 0.1800},
-        5: {"sigma": 3.431, "epsilon": 0.1050},
-        6: {"sigma": 3.260, "epsilon": 0.0690},
-        7: {"sigma": 3.118, "epsilon": 0.0600},
-        8: {"sigma": 2.996, "epsilon": 0.0500},
-        9: {"sigma": 2.889, "epsilon": 0.0420},
-        10: {"sigma": 2.983, "epsilon": 0.0300},
-        11: {"sigma": 2.905, "epsilon": 0.1110},
-        12: {"sigma": 4.008, "epsilon": 0.5050},
-        13: {"sigma": 3.826, "epsilon": 0.4020},
-        14: {"sigma": 3.694, "epsilon": 0.3050},
-        15: {"sigma": 3.594, "epsilon": 0.2740},
-        16: {"sigma": 3.516, "epsilon": 0.2270},
-        17: {"sigma": 3.404, "epsilon": 0.1850},
-        18: {"sigma": 3.812, "epsilon": 0.0350},
-        19: {"sigma": 3.487, "epsilon": 0.2380},
-        20: {"sigma": 3.316, "epsilon": 0.0190},
-        21: {"sigma": 3.294, "epsilon": 0.0170},
-        22: {"sigma": 3.273, "epsilon": 0.0160},
-        23: {"sigma": 3.249, "epsilon": 0.0150},
-        24: {"sigma": 3.210, "epsilon": 0.0130},
-        25: {"sigma": 3.174, "epsilon": 0.0130},
-        26: {"sigma": 3.144, "epsilon": 0.0130},
-        27: {"sigma": 3.116, "epsilon": 0.0130},
-        28: {"sigma": 3.083, "epsilon": 0.0050},
-        29: {"sigma": 3.002, "epsilon": 0.1240},
-        30: {"sigma": 4.383, "epsilon": 0.4150},
-        31: {"sigma": 4.310, "epsilon": 0.3790},
-        32: {"sigma": 4.280, "epsilon": 0.3090},
-        33: {"sigma": 4.336, "epsilon": 0.2910},
-        34: {"sigma": 4.403, "epsilon": 0.2510},
-        35: {"sigma": 4.463, "epsilon": 0.2200},
-    }
+# ---------------------------------------------------------------------------
+# Molecule-level (charge / spin) conditioning
+# ---------------------------------------------------------------------------
+# Charge and spin enter as two scalars — the formal charge in electrons and the
+# number of unpaired electrons (spin multiplicity - 1) — projected by a small MLP
+# and added to every atom's embedding. Scalars rather than one-hot categories
+# because BOSTMC's low-spin charges span -8..+8 with single-structure tails that
+# a category would never learn, and because a scalar lets you ask the trained
+# model for a charge/spin combination that never appeared in training. The MLP's
+# last layer starts at zero, so a freshly built conditioned model behaves exactly
+# like the unconditioned one and learns to use the conditioning from there.
+
+
+def _conditioned_rebind_class() -> Any:
+    """Define (once) the REBIND subclass that adds global conditioning."""
+    global _CONDITIONED_REBIND
+    if _CONDITIONED_REBIND is not None:
+        return _CONDITIONED_REBIND
+
+    class ConditionedREBIND(_REBIND):  # type: ignore[misc, valid-type]
+        """REBIND conditioned on molecule-level charge and spin."""
+
+        def __init__(self, config: Any, n_global_features: int = N_GLOBAL_FEATURES) -> None:
+            super().__init__(config)
+            self.global_cond = global_condition_mlp(n_global_features, config.d_model)
+
+        def forward(self, **inputs):
+            global_features = inputs.get("global_features")
+            if global_features is not None:
+                inputs["global_embedding"] = self.global_cond(global_features.to(torch.float32))
+            return super().forward(**inputs)
+
+    _CONDITIONED_REBIND = ConditionedREBIND
+    return ConditionedREBIND
 
 
 def _patched_encoder_forward(self, **inputs):
@@ -211,7 +204,8 @@ def _patched_encoder_forward(self, **inputs):
     node_attr = inputs.get("node_attr")
     node_embedding = self.node_embedding(node_attr)
     lap = inputs.get("lap_eigenvectors")
-    node_embedding = _add_lap_out_of_place(node_embedding, lap)
+    node_embedding = add_lap_out_of_place(node_embedding, lap)
+    node_embedding = apply_global_conditioning(node_embedding, inputs)
     inputs["node_embedding"] = node_embedding
 
     attn_weight_dict: dict = {}
@@ -227,7 +221,7 @@ def _patched_decoder_forward(self, **inputs):
     """Out-of-place equivalent of ``Decoder.forward`` from vendored ReBind."""
     node_embedding = inputs.get("node_embedding")
     lap = inputs.get("lap_eigenvectors")
-    node_embedding = _add_lap_out_of_place(node_embedding, lap)
+    node_embedding = add_lap_out_of_place(node_embedding, lap)
     inputs["node_embedding"] = node_embedding
 
     attn_weight_dict: dict = {}
@@ -237,18 +231,6 @@ def _patched_decoder_forward(self, **inputs):
         inputs["node_embedding"] = node_embedding
         attn_weight_dict[f"decoder_block_{i}"] = attn_weight
     return {"node_embedding": node_embedding, "attn_weight_dict": attn_weight_dict}
-
-
-def _add_lap_out_of_place(node_embedding: torch.Tensor, lap: torch.Tensor) -> torch.Tensor:
-    """Add ``lap`` into the leading channels of ``node_embedding`` without in-place ops."""
-    d = node_embedding.shape[-1]
-    lap_dim = lap.shape[-1]
-    if lap_dim < d:
-        pad = (0, d - lap_dim)
-        lap = torch.nn.functional.pad(lap, pad)
-    elif lap_dim > d:
-        lap = lap[..., :d]
-    return node_embedding + lap
 
 
 def patch_inplace_lap_addition() -> None:
@@ -318,7 +300,7 @@ def _patched_rebind_forward(self, **inputs):
     # Laplacian positional encoding to that same tensor in place, so upstream's
     # residual head actually receives ``encoder output + PE``. The out-of-place
     # decoder patch no longer mutates it, so the PE is added explicitly here.
-    inputs["pred_conformation"] = _add_lap_out_of_place(node_embedding, inputs["lap_eigenvectors"])
+    inputs["pred_conformation"] = add_lap_out_of_place(node_embedding, inputs["lap_eigenvectors"])
     inputs["node_embedding"] = node_embedding
 
     sigma, epsilon = inputs.get("sigma"), inputs.get("epsilon")
@@ -396,6 +378,16 @@ def get_collator():
     return _Collator
 
 
+def build_collator(conditioned: bool = False):
+    """Collator instance for the DataLoader.
+
+    With ``conditioned=True`` it also emits the charge / spin features that a
+    model from ``build_rebind(n_global_features=...)`` expects.
+    """
+    base = get_collator()()
+    return GlobalConditionCollator(base) if conditioned else base
+
+
 def build_rebind(
     n_layers: int = 8,
     d_model: int = 512,
@@ -403,8 +395,13 @@ def build_rebind(
     n_head: int = 8,
     atom_vocab_size: int = 513,
     dropout: float = 0.0,
+    n_global_features: int = 0,
 ):
-    """Instantiate a REBIND model from a flat keyword-style config."""
+    """Instantiate a REBIND model from a flat keyword-style config.
+
+    ``n_global_features > 0`` returns the variant conditioned on molecule-level
+    charge and spin; pair it with ``build_collator(conditioned=True)``.
+    """
     _load_rebind()
     config = _REBINDConfig(
         n_encode_layers=n_layers,
@@ -425,4 +422,6 @@ def build_rebind(
         dropout=dropout,
         d_ffn=d_ffn,
     )
+    if n_global_features:
+        return _conditioned_rebind_class()(config, n_global_features=n_global_features)
     return _REBIND(config)

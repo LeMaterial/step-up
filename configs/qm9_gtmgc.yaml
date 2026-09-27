@@ -1,0 +1,50 @@
+# GTMGC (Xu et al., ICLR 2024) on QM9, same data and split as configs/qm9_rebind.yaml
+# so the two models are directly comparable.
+#
+# Reference numbers for QM9 test, as tabulated in the ReBind paper:
+#   GTMGC  D-MAE 0.281  D-RMSE 0.471  C-RMSD 0.414
+#   ReBind D-MAE 0.254  D-RMSE 0.446  C-RMSD 0.321
+#
+# Architecture follows their released QM9 checkpoint (RichXuOvO/GTMGC-Qm9):
+# 6 + 6 layers, d_model 256, d_ffn 1024, 8 heads, Mole-BERT token embeddings.
+# Their conformer models embed tokenizer ids rather than atom types, so the
+# per-atom ids must be precomputed first:
+#
+#   uv run python scripts/tokenize_molebert.py -c configs/qm9_gtmgc.yaml \
+#       --out /home/gridsan/jtoney/step-up-data/qm9/qm9-molebert-tokens.csv
+model: gtmgc
+dataset_path: /home/gridsan/jtoney/step-up-data/qm9/qm9-rebind.csv
+dataset_source: sdf
+subset_size: null
+id_column: mol_id
+split_column: split
+token_file: /home/gridsan/jtoney/step-up-data/qm9/qm9-molebert-tokens.csv
+max_drop_fraction: 0.05
+
+n_layers: 6
+d_model: 256
+d_ffn: 1024
+n_head: 8
+dropout: 0.0
+
+# Optimization from their experiments/conformer_prediction/gtmgc_for_conformer_prediction.sh.
+# That script is the Molecule3D one (the repo ships no QM9 variant), so the learning
+# rate is theirs for Molecule3D; everything else is shared across their runs. As with
+# ReBind we train in fp32 rather than their fp16 (see README).
+epochs: 20
+batch_size: 100
+eval_batch_size: 100
+lr: 5.0e-5
+weight_decay: 0.0
+warmup_ratio: 0.1
+adam_beta1: 0.9
+adam_beta2: 0.99
+adam_eps: 1.0e-8
+lr_schedule: linear
+grad_clip: 1.0
+drop_last: true
+num_workers: 4
+
+device: cuda
+output_dir: outputs/qm9_gtmgc
+seed: 42
