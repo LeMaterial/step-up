@@ -230,6 +230,13 @@ absolute distance error and grows with molecular size.
 | tmQMg, complete | 1,360 | 0.892 | 1.353 | 2.325 | 15.7% |
 | BOSTMC low-spin | 12,150 | 0.964 | 1.496 | 2.532 | 16.1% |
 
+Hydrogens are predicted throughout: every dataset carries explicit hydrogen and
+the loss covers every atom. D-MAE and D-RMSE include them, here and in ReBind's
+own `evaluate.py`. The RMSD column above, however, does *not* exclude them the
+way the QM9 C-RMSD does — the MOL2 rows build no RDKit molecule, so
+`Chem.RemoveHs` never ran. The evaluator now drops hydrogens from that path too,
+by atom type, so reruns will report lower RMSDs than this table.
+
 The three organometallic rows predate the full UFF Lennard-Jones table and were
 trained with a flat sigma/epsilon for every element past Kr, so they are a floor
 rather than a result. They want rerunning before the numbers travel anywhere.

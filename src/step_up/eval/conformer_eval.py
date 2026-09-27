@@ -80,6 +80,11 @@ def evaluate_split(
     built, else aligned coordinates) or ``"aligned_coords"`` to force the plain
     metric everywhere, which is what makes RMSD comparable between the organic
     and organometallic sets.
+
+    ``remove_hs`` applies to both RMSD paths — via ``Chem.RemoveHs`` for the
+    RDKit one and via the atom types for the aligned-coordinate one. It never
+    touches D-MAE / D-RMSE, which pool over every atom including hydrogen, as
+    ReBind's ``evaluate.py`` does.
     """
     if rmsd_method not in ("auto", "aligned_coords"):
         raise ValueError(f"Unknown rmsd_method: {rmsd_method!r}")
@@ -119,7 +124,15 @@ def evaluate_split(
             if mol is None:
                 # Optimal rigid alignment on this molecule's real atoms. Not
                 # symmetry matched, so only compare to other aligned_coords numbers.
-                total_rmsd += kabsch_rmsd(pred, target)
+                # `node_type` is Z here (the collator shifted it by 1 so 0 can
+                # mean padding), so hydrogens can be dropped without RDKit —
+                # which matters: they are a third of the atoms in a metal complex
+                # and the hardest to place.
+                if remove_hs:
+                    heavy = device_batch["node_type"][row][keep] != 1
+                    total_rmsd += kabsch_rmsd(pred[heavy.cpu()], target[heavy.cpu()])
+                else:
+                    total_rmsd += kabsch_rmsd(pred, target)
                 n_rmsd += 1
             else:
                 ref = _predicted_mol(mol, target.tolist())

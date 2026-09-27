@@ -75,6 +75,27 @@ def test_forcing_aligned_coords_skips_rdkit(qm9_sdf_path) -> None:
         evaluate_split(_PerfectModel(), ds, subset, get_collator()(), rmsd_method="kabsch")
 
 
+def test_aligned_coords_rmsd_can_drop_hydrogens(bostmc_path) -> None:
+    """The MOL2 path has no RDKit molecule, so it must drop Hs by atom type.
+
+    Organometallic RMSD was being reported over every atom while the QM9 C-RMSD
+    excluded hydrogen, which is not a comparison.
+    """
+    ds = CSVMoleculeDataset(bostmc_path, "mol2")
+    subset = Subset(ds, list(range(len(ds))))
+    torch.manual_seed(0)
+    model = build_rebind(n_layers=1, d_model=32, d_ffn=64, n_head=4)
+    heavy = evaluate_split(model, ds, subset, get_collator()(), batch_size=2, remove_hs=True)
+    everything = evaluate_split(model, ds, subset, get_collator()(), batch_size=2, remove_hs=False)
+
+    assert heavy["c_rmsd_method"] == everything["c_rmsd_method"] == "aligned_coords"
+    assert heavy["c_rmsd"] != everything["c_rmsd"], "the fixture molecules have hydrogens"
+    # Dropping atoms changes only the RMSD; the distance metrics pool over all
+    # atoms either way, as ReBind's evaluate.py does.
+    assert heavy["d_mae"] == everything["d_mae"]
+    assert heavy["d_rmse"] == everything["d_rmse"]
+
+
 def test_kabsch_rmsd_is_invariant_to_rigid_motion() -> None:
     """A rotated and translated copy of a structure has zero RMSD."""
     torch.manual_seed(0)
