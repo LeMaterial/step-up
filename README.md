@@ -230,6 +230,11 @@ absolute distance error and grows with molecular size.
 | tmQMg, complete | 1,360 | 0.892 | 1.353 | 2.325 | 15.7% |
 | BOSTMC low-spin | 12,150 | 0.964 | 1.496 | 2.532 | 16.1% |
 
+The three organometallic rows predate the full UFF Lennard-Jones table and were
+trained with a flat sigma/epsilon for every element past Kr, so they are a floor
+rather than a result. They want rerunning before the numbers travel anywhere.
+The QM9 rows are unaffected: that table only covers Z=1..36 either way.
+
 Organometallic error is about twice QM9's in relative terms, not the four times
 raw D-MAE suggests. Global structure degrades further than pairwise distances do:
 RMSD is 27% of the mean pairwise distance on QM9 against 41-42% on the
