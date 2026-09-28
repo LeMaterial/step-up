@@ -113,3 +113,70 @@ def test_sdf_source_uses_published_bonds_and_split(qm9_sdf_path) -> None:
     methane = ds[0]
     assert methane["num_nodes"] == 5
     assert methane["num_edges"] == 8
+
+
+# The numH atom feature is column 4 of ReBind's 9-column atom feature vector,
+# and the degree is column 2.
+_NUMH_COLUMN = 4
+_DEGREE_COLUMN = 2
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "source"),
+    [("qm9_sdf_path", "sdf"), ("tmqmg_path", "mol2"), ("bostmc_path", "mol2")],
+)
+def test_remove_hs_drops_hydrogens_from_every_source(fixture_name, source, request) -> None:
+    """Training without hydrogens has to work the same on both featurization paths."""
+    path = request.getfixturevalue(fixture_name)
+    full = CSVMoleculeDataset(path, source=source)
+    heavy = CSVMoleculeDataset(path, source=source, remove_hs=True)
+    assert len(full) == len(heavy)
+
+    saw_hydrogen = False
+    for i in range(len(full)):
+        before, after = full[i], heavy[i]
+        _check_graph_dict(after)
+        n_h = sum(1 for z in before["node_type"] if z == 0)  # node_type is Z - 1
+        saw_hydrogen = saw_hydrogen or n_h > 0
+        assert after["num_nodes"] == before["num_nodes"] - n_h
+        assert 0 not in after["node_type"], "a hydrogen survived the strip"
+        # Bonds to a dropped atom go too, and the survivors stay in range.
+        assert all(idx < after["num_nodes"] for side in after["edge_index"] for idx in side)
+        # Hydrogen count survives as an atom feature, so the graph still knows
+        # how many there were — only where they were is gone. (RDKit reports 0
+        # while the hydrogens are explicit atoms and fills the count in once they
+        # are removed, so this is checked against the bond graph, not against the
+        # feature in `before`.)
+        attached = [0] * before["num_nodes"]
+        for a, b in zip(*before["edge_index"], strict=True):
+            if before["node_type"][b] == 0:
+                attached[a] += 1
+        assert [row[_NUMH_COLUMN] for row in after["node_attr"]] == [
+            count for count, z in zip(attached, before["node_type"], strict=True) if z != 0
+        ]
+    assert saw_hydrogen, "fixture has no hydrogens, so this proves nothing"
+
+
+def test_remove_hs_reports_the_heavy_atom_degree(qm9_sdf_path) -> None:
+    """Degree must count surviving bonds, or it would disagree with the edges."""
+    heavy = CSVMoleculeDataset(qm9_sdf_path, source="sdf", remove_hs=True)
+    for i in range(len(heavy)):
+        graph = heavy[i]
+        counted = [0] * graph["num_nodes"]
+        for node in graph["edge_index"][0]:
+            counted[node] += 1
+        assert [row[_DEGREE_COLUMN] for row in graph["node_attr"]] == counted
+
+
+def test_remove_hs_keeps_rdkit_mol_aligned_with_the_graph(qm9_sdf_path) -> None:
+    """C-RMSD writes predicted coordinates onto this molecule by atom index.
+
+    If it still carried hydrogens while the graph did not, every coordinate
+    after the first hydrogen would land on the wrong atom.
+    """
+    heavy = CSVMoleculeDataset(qm9_sdf_path, source="sdf", id_column="mol_id", remove_hs=True)
+    for i in range(len(heavy)):
+        assert heavy.rdkit_mol(i).GetNumAtoms() == heavy[i]["num_nodes"]
+
+    full = CSVMoleculeDataset(qm9_sdf_path, source="sdf", id_column="mol_id")
+    assert full.rdkit_mol(0).GetNumAtoms() == full[0]["num_nodes"]

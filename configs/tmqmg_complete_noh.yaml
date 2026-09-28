@@ -1,0 +1,61 @@
+# Heavy-atom tmQMg: configs/tmqmg_complete.yaml with hydrogens dropped.
+# GeoDiff and ConfGF tmQMg baselines from their paper without a caveat.
+#
+# Three snapshots of tmQMg exist, and they are nested, not recalculated (n_atoms,
+# charge and electronic energies are bit-identical wherever they overlap):
+#   - complete, 60,799 rows: the original release, used here.
+#   - filtered, 58,409 rows: the same minus the 2,390 IDs in tmQMg's outliers.txt
+#     (unphysical geometries the community flagged). That's configs/tmqmg.yaml.
+#   - latest, 74,547 rows: the 2024 extension, which also dropped 87 of the
+#     originals, 87 of them in TMCgen's split.
+#
+# Only the complete snapshot covers all 60,465 complexes in TMCgen's split,
+# including all 1,360 of their test complexes; 2,379 of the outlier structures are
+# in their split and 38 are in their test set, so the baselines were trained and
+# scored with them. The 334 rows here that TMCgen never used are dropped.
+dataset_path: /home/gridsan/jtoney/step-up-data/tmQMg-complete.csv
+dataset_source: mol2
+subset_size: null
+id_column: id
+split_files:
+  train: /home/gridsan/jtoney/step-up-data/tmqmg/complexes-train.txt
+  val: /home/gridsan/jtoney/step-up-data/tmqmg/complexes-val-split.txt
+  test: /home/gridsan/jtoney/step-up-data/tmqmg/complexes-test-split.txt
+
+# Charge runs -1 / 0 / +1; every complex is a closed-shell singlet, so the spin
+# feature is constant. Same conditioning as BOSTMC so the runs share an architecture.
+charge_column: charge
+spin_column: null
+
+n_layers: 8
+d_model: 512
+d_ffn: 1024
+n_head: 8
+dropout: 0.0
+
+# Optimization as in ReBind's rebind.sh (see README for the fp16 exception).
+epochs: 20
+batch_size: 100
+eval_batch_size: 100
+lr: 9.0e-5
+weight_decay: 0.0
+warmup_ratio: 0.1
+adam_beta1: 0.9
+adam_beta2: 0.99
+adam_eps: 1.0e-8
+lr_schedule: linear
+grad_clip: 1.0
+drop_last: true
+num_workers: 4
+
+device: cuda
+output_dir: outputs/tmqmg_complete_full_noh
+seed: 42
+
+# Heavy-atom variant: hydrogens are dropped from the graph, so the model never
+# sees or predicts them. Paired with configs/tmqmg_complete.yaml to separate "the model is
+# bad at hydrogen" from "the model is bad at geometry". Each heavy atom keeps its
+# hydrogen count in the numH feature, so the graph is not missing the chemistry,
+# only the positions. Note this departs from the published setup, which keeps
+# hydrogen explicit, so it is not a reproduction run.
+remove_hs: true

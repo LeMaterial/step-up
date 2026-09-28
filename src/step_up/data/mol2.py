@@ -21,7 +21,7 @@ Bond features (4 per bond, undirected expanded to two directed entries):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -260,12 +260,49 @@ def _find_ring_atoms_and_bonds(
     return ring_atom_set, ring_edge_set
 
 
-def mol2_to_graph_dict(mol2_text: str, coords: np.ndarray | None = None) -> dict[str, Any]:
+def _count_h_neighbors(parsed: Mol2) -> list[int]:
+    """Number of hydrogens bonded to each atom."""
+    counts = [0] * len(parsed.atoms)
+    for b in parsed.bonds:
+        if parsed.atoms[b.b].element == "H":
+            counts[b.a] += 1
+        if parsed.atoms[b.a].element == "H":
+            counts[b.b] += 1
+    return counts
+
+
+def _drop_hydrogens(
+    parsed: Mol2, conformer: list[list[float]], num_h_neighbors: list[int]
+) -> tuple[Mol2, list[list[float]], list[int]]:
+    """Return ``parsed`` without its hydrogens, reindexed, with coords and numH to match."""
+    keep = [i for i, atom in enumerate(parsed.atoms) if atom.element != "H"]
+    if not keep:
+        raise ValueError("MOL2 block has no heavy atoms")
+    remap = {old: new for new, old in enumerate(keep)}
+    filtered = Mol2(
+        atoms=[replace(parsed.atoms[i], idx=remap[i]) for i in keep],
+        bonds=[
+            replace(b, a=remap[b.a], b=remap[b.b])
+            for b in parsed.bonds
+            if b.a in remap and b.b in remap
+        ],
+    )
+    return filtered, [conformer[i] for i in keep], [num_h_neighbors[i] for i in keep]
+
+
+def mol2_to_graph_dict(
+    mol2_text: str, coords: np.ndarray | None = None, remove_hs: bool = False
+) -> dict[str, Any]:
     """Build a ReBind-format graph dict directly from a MOL2 block.
 
     If ``coords`` is supplied (e.g. parsed from a separate XYZ column),
     it overrides the MOL2 coordinates — useful when the canonical geometry
     lives in a different column. Otherwise we use the MOL2 atom positions.
+
+    ``remove_hs`` drops hydrogens from the graph, so the model neither sees nor
+    predicts them. It mirrors RDKit's ``Chem.RemoveHs``: the hydrogen count
+    survives in each heavy atom's ``numH`` feature, and ``degree`` becomes the
+    heavy-atom degree.
     """
     parsed = parse_mol2(mol2_text)
     n = len(parsed.atoms)
@@ -280,6 +317,14 @@ def mol2_to_graph_dict(mol2_text: str, coords: np.ndarray | None = None) -> dict
     else:
         conformer = np.stack([a.coords for a in parsed.atoms], axis=0).tolist()
 
+    # Counted over the whole molecule, before any hydrogen is dropped, so the
+    # numH feature says the same thing either way.
+    num_h_neighbors = _count_h_neighbors(parsed)
+
+    if remove_hs:
+        parsed, conformer, num_h_neighbors = _drop_hydrogens(parsed, conformer, num_h_neighbors)
+        n = len(parsed.atoms)
+
     # ---- Bonds first (need degree, numH, in-ring) -------------------------
     bond_pairs: list[tuple[int, int]] = []
     bond_types: list[str] = []
@@ -292,14 +337,9 @@ def mol2_to_graph_dict(mol2_text: str, coords: np.ndarray | None = None) -> dict
 
     ring_atoms, _ring_bonds = _find_ring_atoms_and_bonds(n, bond_pairs)
     degree = [0] * n
-    num_h_neighbors = [0] * n
     for a, b in bond_pairs:
         degree[a] += 1
         degree[b] += 1
-        if parsed.atoms[b].element == "H":
-            num_h_neighbors[a] += 1
-        if parsed.atoms[a].element == "H":
-            num_h_neighbors[b] += 1
 
     # ---- Atom features ----------------------------------------------------
     node_attr: list[list[int]] = []

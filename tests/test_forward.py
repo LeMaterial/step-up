@@ -141,3 +141,26 @@ def test_uff_table_agrees_with_rebinds_own_values() -> None:
     for node_type, params in upstream.items():
         assert UFF_LJ_PARAMETERS[node_type] == (params["sigma"], params["epsilon"])
     assert max(UFF_LJ_PARAMETERS) > max(upstream)
+
+
+def test_single_heavy_atom_molecules_survive_the_forward_pass(qm9_sdf_path) -> None:
+    """Methane without its hydrogens is one atom and no bonds.
+
+    QM9 has a handful of these, and a one-node graph is where a Laplacian
+    positional encoding would divide by zero if the degree were not floored.
+    """
+    ds = CSVMoleculeDataset(qm9_sdf_path, source="sdf", remove_hs=True)
+    assert min(ds[i]["num_nodes"] for i in range(len(ds))) == 1
+    loader = DataLoader(
+        Subset(ds, list(range(len(ds)))), batch_size=len(ds), collate_fn=get_collator()()
+    )
+    batch = next(iter(loader))
+    assert torch.isfinite(batch["lap_eigenvectors"]).all()
+
+    torch.manual_seed(0)
+    model = build_rebind(n_layers=1, d_model=32, d_ffn=64, n_head=4)
+    model.eval()
+    with torch.no_grad():
+        out = model(**batch)
+    assert torch.isfinite(out.loss)
+    assert torch.isfinite(out.conformer_hat).all()

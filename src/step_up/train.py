@@ -71,6 +71,10 @@ class TrainConfig:
     cache_dataset: bool = False
     # Fail validation if more than this fraction of rows are dropped.
     max_drop_fraction: float = 0.5
+    # Train on heavy atoms only: hydrogens are dropped from the graph, so the
+    # model never sees or predicts them. A different model, not a different
+    # metric — the published ReBind and GTMGC setups keep hydrogen explicit.
+    remove_hs: bool = False
 
     # Model
     n_layers: int = 8
@@ -327,6 +331,7 @@ def build_splits(config: TrainConfig) -> tuple[CSVMoleculeDataset, Subset, Subse
         charge_column=config.charge_column,
         spin_column=config.spin_column,
         token_file=config.token_file,
+        remove_hs=config.remove_hs,
     )
     if config.split_files:
         if config.id_column is None:

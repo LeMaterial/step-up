@@ -30,6 +30,7 @@ from .featurize import (
     featurize_molblock,
     featurize_xyz,
     mol_from_xyz_block,
+    remove_hydrogens,
 )
 
 # Embedded XYZ/MOL2 fields blow past the default csv.field_size_limit. Raise it
@@ -123,6 +124,11 @@ class CSVMoleculeDataset(Dataset):
         spin multiplicity. When given, each graph dict carries ``charge`` and
         ``spin_multiplicity`` for the model's global conditioning. A missing
         column means neutral / closed-shell.
+    remove_hs
+        Drop hydrogens from every graph, so the model neither sees nor predicts
+        them. This is a different model, not a different metric: it changes what
+        the network is trained on. Each heavy atom keeps its hydrogen count in
+        the ``numH`` feature either way.
     """
 
     def __init__(
@@ -140,11 +146,13 @@ class CSVMoleculeDataset(Dataset):
         charge_column: str | None = None,
         spin_column: str | None = None,
         token_file: str | Path | None = None,
+        remove_hs: bool = False,
     ) -> None:
         self.path = Path(path)
         if not self.path.exists():
             raise FileNotFoundError(self.path)
         self.source = source
+        self.remove_hs = remove_hs
         self.id_column = id_column
         self.split_column = split_column
         self.charge_column = charge_column
@@ -229,10 +237,14 @@ class CSVMoleculeDataset(Dataset):
         """
         row = self._df.iloc[self._valid_indices[idx]]
         if self.source == "sdf":
-            return Chem.MolFromMolBlock(str(row["sdf"]), removeHs=False)
-        if self.source == "smiles":
-            return mol_from_xyz_block(str(row["xyz"]))
-        raise NotImplementedError(f"source {self.source!r} does not go through RDKit")
+            mol = Chem.MolFromMolBlock(str(row["sdf"]), removeHs=False)
+        elif self.source == "smiles":
+            mol = mol_from_xyz_block(str(row["xyz"]))
+        else:
+            raise NotImplementedError(f"source {self.source!r} does not go through RDKit")
+        # Must have the same atoms in the same order as the graph dict, or the
+        # evaluator would write predicted coordinates onto the wrong atoms.
+        return remove_hydrogens(mol, self.remove_hs) if mol is not None else None
 
     def split_labels(self) -> list[str]:
         """Published split name per row, aligned with dataset indices."""
@@ -248,11 +260,11 @@ class CSVMoleculeDataset(Dataset):
     def _featurize(self, real_idx: int) -> dict[str, Any]:
         row = self._df.iloc[real_idx]
         if self.source == "smiles":
-            graph = featurize_xyz(str(row["xyz"]))
+            graph = featurize_xyz(str(row["xyz"]), remove_hs=self.remove_hs)
         elif self.source == "sdf":
-            graph = featurize_molblock(str(row["sdf"]))
+            graph = featurize_molblock(str(row["sdf"]), remove_hs=self.remove_hs)
         else:
-            graph = featurize_mol2_xyz(str(row["mol2"]), str(row["xyz"]))
+            graph = featurize_mol2_xyz(str(row["mol2"]), str(row["xyz"]), remove_hs=self.remove_hs)
         # Molecule-level state for conditioning; the collator turns these into
         # model inputs. Absent columns mean a neutral closed-shell molecule.
         if self.charge_column is not None:

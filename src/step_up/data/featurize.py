@@ -59,6 +59,21 @@ def _load_rebind_data_utils() -> Any:
     return mod
 
 
+def remove_hydrogens(mol: Chem.Mol, remove_hs: bool) -> Chem.Mol:
+    """Strip explicit hydrogens when asked, so the model never sees them.
+
+    RDKit keeps the hydrogen count in each heavy atom's ``GetTotalNumHs``, which
+    is the ``numH`` atom feature, so removal costs the graph no information about
+    how many hydrogens were there — only where they were.
+    """
+    if not remove_hs:
+        return mol
+    stripped = Chem.RemoveHs(mol)
+    if stripped.GetNumAtoms() == 0:
+        raise ValueError("molecule has no heavy atoms")
+    return stripped
+
+
 def mol_to_graph_dict(mol: Chem.Mol) -> dict[str, Any]:
     """Thin wrapper around ReBind's canonical ``data.utils.mol_to_graph_dict``."""
     return _load_rebind_data_utils().mol_to_graph_dict(mol)
@@ -118,7 +133,7 @@ def mol_from_xyz_block(xyz_block: str, charge: int = 0) -> Chem.Mol:
     return mol
 
 
-def featurize_xyz(xyz_block: str, charge: int = 0) -> dict[str, Any]:
+def featurize_xyz(xyz_block: str, charge: int = 0, remove_hs: bool = False) -> dict[str, Any]:
     """One-shot helper: XYZ-only featurization (QM9 path).
 
     Coordinates come from the XYZ block; bonds are inferred. The original
@@ -126,10 +141,10 @@ def featurize_xyz(xyz_block: str, charge: int = 0) -> dict[str, Any]:
     and the resulting atom order matches the XYZ.
     """
     mol = mol_from_xyz_block(xyz_block, charge=charge)
-    return mol_to_graph_dict(mol)
+    return mol_to_graph_dict(remove_hydrogens(mol, remove_hs))
 
 
-def featurize_molblock(molblock: str) -> dict[str, Any]:
+def featurize_molblock(molblock: str, remove_hs: bool = False) -> dict[str, Any]:
     """Featurize one SDF/MOL record (the QM9 path for ReBind's published data).
 
     Bonds and coordinates are read from the record, so nothing is re-perceived
@@ -140,14 +155,14 @@ def featurize_molblock(molblock: str) -> dict[str, Any]:
     mol = Chem.MolFromMolBlock(molblock, removeHs=False)
     if mol is None:
         raise ValueError("RDKit failed to parse the molblock")
-    return mol_to_graph_dict(mol)
+    return mol_to_graph_dict(remove_hydrogens(mol, remove_hs))
 
 
-def featurize_mol2_xyz(mol2_block: str, xyz_block: str) -> dict[str, Any]:
+def featurize_mol2_xyz(mol2_block: str, xyz_block: str, remove_hs: bool = False) -> dict[str, Any]:
     """One-shot helper for MOL2-sourced rows (tmQMg, BOSTMC).
 
     No RDKit — the MOL2 file already contains all connectivity and bond types
     we need, and we keep the XYZ-block coordinates as the canonical geometry.
     """
     _, coords = parse_xyz_block(xyz_block)
-    return mol2_to_graph_dict(mol2_block, coords=coords)
+    return mol2_to_graph_dict(mol2_block, coords=coords, remove_hs=remove_hs)
