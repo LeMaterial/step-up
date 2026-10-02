@@ -118,6 +118,36 @@ logs, per-epoch history, best checkpoint (by val D-MAE), and the test-set
 metrics of that checkpoint (`test_metrics.json`) to the `output_dir` specified
 in the config — default is `outputs/<dataset>_full/`.
 
+### Scoring a run and exporting its structures
+
+```bash
+sbatch scripts/eval_and_dump.sh configs/bostmc.yaml
+```
+
+That scores the test split and exports every predicted structure from the same
+checkpoint, so the metrics and the geometry can never describe different states.
+It writes `eval_test.json` (heavy-atom RMSD), `eval_test_keephs.json` (RMSD over
+all atoms) and `structures_test.csv` into the run's `output_dir`.
+
+`structures_test.csv` carries one row per test molecule:
+
+| Column | |
+|---|---|
+| `id` | the row's `id_column` value — `mol_id`, tmQMg `id`, BOSTMC `refcode` |
+| `charge`, `spin_multiplicity` | from the source CSV; **blank when the data does not say**, rather than defaulted |
+| `n_atoms`, `elements` | atom count and symbols, in prediction order |
+| `xyz_true`, `xyz_pred` | XYZ blocks, same atoms in the same order, overlayable as-is |
+| `d_mae`, `d_rmse`, `rmsd` | that molecule's own errors, for sorting and filtering |
+
+`xyz_pred` is Kabsch-aligned onto `xyz_true` per molecule: rotation and
+translation only, so bond lengths and angles are the model's own. The alignment
+is done here because both vendored models align inside their prediction head over
+the *padded* batch tensor, where padding zeros drag the centroid and rotation off.
+
+`scripts/compare_runs.py` reads those dumps plus the metrics JSON and prints the
+comparison table below, recomputing D-MAE from the geometry as a cross-check that
+the two agree.
+
 ### Reproducing ReBind's published QM9 numbers
 
 `configs/qm9_rebind.yaml` trains on the QM9 copy ReBind and GTMGC used
@@ -213,44 +243,79 @@ for f in config.json pytorch_model.bin; do
 done
 ```
 
-### Organometallic results
+### Benchmark results
 
-All on each dataset's published/project split, scored with `step-up evaluate`.
-RMSD here is Kabsch alignment on each molecule's real atoms, without symmetry
-matching, so it is comparable across rows but *not* to a GetBestRMS C-RMSD.
-"Relative" is D-MAE over the mean pairwise distance of that test set, which is
-what makes organic and organometallic errors comparable at all: D-MAE is an
-absolute distance error and grows with molecular size.
+Every row is that dataset's published or project split, scored with
+`step-up evaluate`, and reproduced independently by `scripts/compare_runs.py`
+from the per-molecule structure dumps. D-MAE is an absolute distance error that
+grows with molecule size, so "Rel." normalizes it by that test set's own mean
+pairwise distance ("Scale"), pooled the same way. RMSD is heavy-atom in every
+row — GetBestRMS on QM9, Kabsch without symmetry matching on the MOL2 sets, so
+compare RMSD across the organometallic rows freely but to QM9 only loosely.
 
-| Run | Test molecules | D-MAE | D-RMSE | RMSD | Relative D-MAE |
-|---|---|---|---|---|---|
-| QM9, ReBind | 10,661 | 0.233 | 0.439 | 0.858 | 7.2% |
-| QM9, GTMGC | 10,661 | 0.264 | 0.462 | 0.931 | 8.2% |
-| tmQMg, outliers removed | 1,322 | 0.890 | 1.351 | 2.316 | 15.7% |
-| tmQMg, complete | 1,360 | 0.892 | 1.353 | 2.325 | 15.7% |
-| BOSTMC low-spin | 12,150 | 0.964 | 1.496 | 2.532 | 16.1% |
+| Run | Test mols | Atoms | D-MAE | D-RMSE | RMSD | Scale | Rel. D-MAE | RMSD/scale |
+|---|---|---|---|---|---|---|---|---|
+| QM9, with H | 10,661 | 18.1 | 0.233 | 0.439 | 0.265 | 3.100 | 7.5% | 8.5% |
+| QM9, heavy atom | 10,661 | 8.8 | 0.042 | 0.132 | 0.187 | 2.441 | 1.7% | 7.7% |
+| tmQMg, with H | 1,360 | 56.7 | 0.892 | 1.353 | 1.810 | 5.806 | 15.4% | 31.2% |
+| tmQMg, heavy atom | 1,360 | 30.2 | 0.627 | 1.058 | 1.823 | 5.205 | 12.0% | 35.0% |
+| BOSTMC, with H | 12,150 | 64.2 | 0.964 | 1.496 | 2.024 | 6.581 | 14.6% | 30.8% |
+| BOSTMC, heavy atom | 12,150 | 35.1 | 0.696 | 1.192 | 2.081 | 5.921 | 11.8% | 35.1% |
 
-Hydrogens are predicted throughout: every dataset carries explicit hydrogen and
-the loss covers every atom. `remove_hs: true` trains the heavy-atom variant
-instead (`configs/*_noh.yaml`), dropping hydrogen from the graph so the model
-neither sees nor predicts it — a different model, not a different metric. Each
-heavy atom keeps its hydrogen count in the `numH` feature either way.
+**Organometallic error is about twice QM9's relative to molecule size,** not the
+four times raw D-MAE suggests. Global structure degrades much further than local
+distances do: RMSD is 8.5% of the mean pairwise distance on QM9 against 31% on
+the organometallic sets. Local geometry is largely right and the overall shape is
+not.
 
-In the runs above, D-MAE and D-RMSE include hydrogen, here and in ReBind's own
-`evaluate.py`. The RMSD column above, however, does *not* exclude them the
-way the QM9 C-RMSD does — the MOL2 rows build no RDKit molecule, so
-`Chem.RemoveHs` never ran. The evaluator now drops hydrogens from that path too,
-by atom type, so reruns will report lower RMSDs than this table.
+**Dropping hydrogen does not produce a better heavy-atom structure.** It makes
+D-MAE look much better — QM9 7.5% to 1.7%, tmQMg 15.4% to 12.0% — but that is
+mostly the hardest atoms leaving the average. On the identical heavy atoms under
+the identical metric, the model trained *with* hydrogen wins: tmQMg RMSD 1.810
+against 1.823, BOSTMC 2.024 against 2.081. Hydrogens are useful supervision for
+the heavy-atom frame, not just extra work. Only QM9 improves at all on RMSD
+(0.265 to 0.187), and barely once normalized (8.5% to 7.7%).
 
-The three organometallic rows predate the full UFF Lennard-Jones table and were
-trained with a flat sigma/epsilon for every element past Kr, so they are a floor
-rather than a result. They want rerunning before the numbers travel anywhere.
-The QM9 rows are unaffected: that table only covers Z=1..36 either way.
+Hydrogens are predicted throughout unless a config sets `remove_hs: true`
+(`configs/*_noh.yaml`), which drops them from the graph so the model neither sees
+nor predicts them — a different model, not a different metric. Each heavy atom
+keeps its hydrogen count in the `numH` feature either way. D-MAE and D-RMSE
+always include hydrogen where it is present, as in ReBind's own `evaluate.py`.
 
-Organometallic error is about twice QM9's in relative terms, not the four times
-raw D-MAE suggests. Global structure degrades further than pairwise distances do:
-RMSD is 27% of the mean pairwise distance on QM9 against 41-42% on the
-organometallic sets.
+### ReBind's rewiring never fires in the released code
+
+ReBind's contribution over GTMGC is rewiring the decoder's attention with
+Lennard-Jones forces: compute an LJ force between non-bonded atom pairs, keep the
+top-k per node, and feed those as extra attraction and repulsion adjacency
+channels. In the released implementation it is dead code, and the numbers above
+were produced without it.
+
+`Collator.__call__` samples `keys = mol_sq[0].keys()` from the *input* graph dict,
+then `_transform` computes `num_near_edges` onto the `Data` object afterwards. The
+padding step guards on `if "num_near_edges" in keys`, which is therefore never
+true, so `num_near_edges` stays the all-zero tensor it was initialized as. With
+`k = 0` everywhere, `retain_top_k` keeps nothing, and both rewiring channels reach
+the decoder as all-zero matrices. Upstream's own `data/utils.py:mol_to_graph_dict`
+returns the same keys ours does and never includes it, so this is not an artifact
+of our featurization.
+
+Measured rather than inferred, on a tmQMg batch containing 4d/5d metals:
+
+- `num_near_edges` is 0 for all 235 real atoms, against adjacency degrees of 1-6.
+- 13,380 candidate non-bonded pairs, **0 retained**.
+- Perturbing the LJ table changes the predicted coordinates by **exactly zero**:
+  not the pre-fix flat sigma/epsilon, not epsilon x1000, not sigma x2.
+
+This explains two things that looked wrong. The LJ retraining was a no-op — the
+corrected tmQMg run scores 0.8918838762 against the pre-fix run's 0.8918838298,
+identical to 7 significant figures because the two trainings differed in nothing
+that reaches the loss. And our QM9 reproduction beats the published C-RMSD (0.265
+against 0.321) while running what is effectively the paper's own ablation.
+
+The full UFF table is still the right thing to carry: it is what the paper
+describes, and it costs nothing. But no result here depends on it, and fixing the
+propagation would produce a model meaningfully different from the released one, so
+it is left as a deliberate choice rather than a silent patch.
 
 Training on tmQMg's 2,379 flagged-unphysical structures costs 0.7% D-MAE
 (0.8902 vs 0.8962 on the identical outlier-free test set) and nothing on RMSD, so
@@ -311,6 +376,9 @@ configs/           # per-dataset YAML configs (smoke + full)
 external/ReBIND/   # git submodule, vendored upstream ReBind
 external/GTMGC/    # git submodule, vendored upstream GTMGC
 scripts/train.sh   # Slurm job script (sbatch scripts/train.sh <config>)
+scripts/eval_and_dump.sh       # score a checkpoint + export its structures
+scripts/dump_structures.py     # per-molecule true/predicted geometry --> CSV
+scripts/compare_runs.py        # size-normalized comparison across finished runs
 scripts/prepare_qm9_rebind.py  # QM9 + ReBind's published split --> CSV
 scripts/tokenize_molebert.py   # per-atom Mole-BERT ids, needed by GTMGC
 tests/             # imports, dataset loading, MOL2 parsing, forward pass, metrics
