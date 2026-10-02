@@ -1,0 +1,29 @@
+# Smallest possible run that exercises the full pipeline on CPU.
+# Goal: prove the loss strictly decreases. Numbers are not meaningful.
+dataset_path: /home/gridsan/jtoney/ElemeNet-benchmarking/benchmarking/datasets/QM9-full.csv
+dataset_source: smiles
+subset_size: 100
+# Split key: mol_id, so QM9's few duplicated rows always share a split.
+id_column: mol_id
+cache_dataset: true
+split_ratios: [0.8, 0.1, 0.1]
+split_seed: 0
+
+# Tiny model — enough capacity to learn distance regression on 80 toy molecules.
+n_layers: 2
+d_model: 64
+d_ffn: 128
+n_head: 4
+dropout: 0.0
+
+epochs: 3
+batch_size: 8
+eval_batch_size: 8
+lr: 3.0e-4
+weight_decay: 0.0
+warmup_ratio: 0.1
+num_workers: 0
+
+device: cpu
+output_dir: outputs/qm9_smoke
+seed: 0

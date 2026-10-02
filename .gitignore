@@ -206,6 +206,10 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# step-up training artifacts and local data
+outputs/
+data/processed/
+
 # PyPI configuration file
 .pypirc
 
@@ -216,3 +220,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Slurm job logs (scripts/train.sh writes train-<jobid>.out into the submit dir)
+*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9].out
+slurm-*.out

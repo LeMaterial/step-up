@@ -1,0 +1,58 @@
+# Full tmQMg training run (~58K organometallic complexes, closed-shell singlets,
+# full d-block + La). GPU-only; staged for Slurm.
+#
+# This copy of tmQMg is the original release minus the 2,390 IDs in the dataset's
+# outliers.txt (unphysical geometries the community flagged), so it is the cleaner
+# training set but NOT the data the published baselines used. See
+# configs/tmqmg_complete.yaml for the run that matches TMCgen exactly.
+#
+# Split: tmQMg's authors publish no canonical ML split, so we adopt TMCgen's
+# (Schaufelberger & Jorner, arXiv 2606.00666), whose paper also reports the GeoDiff
+# and ConfGF tmQMg baselines we will compare against. Their refcode lists live in
+# github.com/digital-chemistry-laboratory/TMCgen under data/raw/tmqmg. They cover
+# 58,086 of the rows here; the 2,379 they list that are missing are exactly the
+# removed outliers, 38 of which are in their test split. Rows in no list are dropped.
+dataset_path: /home/gridsan/jtoney/ElemeNet-benchmarking/benchmarking/datasets/tmQMg-full.csv
+dataset_source: mol2
+subset_size: null
+id_column: id
+split_files:
+  train: /home/gridsan/jtoney/step-up-data/tmqmg/complexes-train.txt
+  val: /home/gridsan/jtoney/step-up-data/tmqmg/complexes-val-split.txt
+  test: /home/gridsan/jtoney/step-up-data/tmqmg/complexes-test-split.txt
+
+# Charge runs -1 / 0 / +1 here and is read from the CSV.
+#
+# There is no spin column in tmQMg to read, so the conditioning collator defaults
+# the unpaired-electron input to 0 for every row. That default is consistent with
+# the data but not measured from it: every complex has an even electron count, so
+# none is *forced* to be open-shell, and tmQM was assembled from closed-shell
+# mononuclear complexes. Treat the spin slot as a constant, which a linear layer
+# absorbs into its bias; it exists only so tmQMg and BOSTMC share an architecture.
+charge_column: charge
+spin_column: null
+
+n_layers: 8
+d_model: 512
+d_ffn: 1024
+n_head: 8
+dropout: 0.0
+
+# Optimization as in ReBind's rebind.sh (see README for the fp16 exception).
+epochs: 20
+batch_size: 100
+eval_batch_size: 100
+lr: 9.0e-5
+weight_decay: 0.0
+warmup_ratio: 0.1
+adam_beta1: 0.9
+adam_beta2: 0.99
+adam_eps: 1.0e-8
+lr_schedule: linear
+grad_clip: 1.0
+drop_last: true
+num_workers: 4
+
+device: cuda
+output_dir: outputs/tmqmg_full
+seed: 42
