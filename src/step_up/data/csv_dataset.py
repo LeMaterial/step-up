@@ -214,6 +214,28 @@ class CSVMoleculeDataset(Dataset):
                 self._cache[real_idx] = graph
         return graph
 
+    def metadata(self, idx: int) -> dict[str, Any]:
+        """Source-CSV facts about item ``idx``: its id, charge and spin multiplicity.
+
+        ``charge`` and ``spin_multiplicity`` are ``None`` when the dataset was
+        built without those columns, which is not the same as neutral or
+        closed-shell — it means the CSV does not say. The conditioning collator
+        does default a missing value, so a ``None`` here marks a number the model
+        was handed rather than told.
+        """
+        real_idx = self._valid_indices[idx]
+        row = self._df.iloc[real_idx]
+        key = (
+            str(row[self.id_column])
+            if self.id_column is not None
+            else str(self._df.index[real_idx])
+        )
+        return {
+            "id": key,
+            "charge": float(row[self.charge_column]) if self.charge_column else None,
+            "spin_multiplicity": float(row[self.spin_column]) if self.spin_column else None,
+        }
+
     def split_keys(self) -> list[str]:
         """Stable per-row keys for :func:`step_up.data.splits.stable_split`.
 

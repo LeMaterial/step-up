@@ -22,8 +22,15 @@ split_files:
   val: /home/gridsan/jtoney/step-up-data/tmqmg/complexes-val-split.txt
   test: /home/gridsan/jtoney/step-up-data/tmqmg/complexes-test-split.txt
 
-# Charge runs -1 / 0 / +1; every complex is a closed-shell singlet, so the spin
-# feature is constant. Same conditioning as BOSTMC so the runs share an architecture.
+# Charge runs -1 / 0 / +1 and is read from the CSV.
+#
+# There is no spin column in tmQMg to read, so `spin_column: null` and the
+# conditioning collator defaults the unpaired-electron input to 0 for every row.
+# That default is consistent with the data but is not measured from it: all
+# 60,799 complexes have an even electron count, so none is *forced* to be
+# open-shell, and tmQM was assembled from closed-shell mononuclear complexes.
+# Treat the spin slot here as a constant, which a linear layer absorbs into its
+# bias; it exists only so tmQMg and BOSTMC share one architecture.
 charge_column: charge
 spin_column: null
 
