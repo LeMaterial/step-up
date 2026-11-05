@@ -20,9 +20,9 @@ Two things worth knowing about ``xyz_pred``:
 - Hydrogens are absent for a model trained with ``remove_hs``, because that
   model never predicted any.
 
-``charge`` and ``spin_multiplicity`` come from the source CSV. They are empty
-when the dataset has no such column, which is not a claim of neutral or
-closed-shell — it means the data does not say.
+``charge`` and ``spin_multiplicity`` come from the source CSV where it has
+them; otherwise a molecule is neutral and singlet (QM9 is both, tmQMg is all
+singlets).
 
 Usage::
 
@@ -141,8 +141,8 @@ def main(argv: list[str] | None = None) -> int:
                 writer.writerow(
                     [
                         meta["id"],
-                        "" if meta["charge"] is None else meta["charge"],
-                        "" if meta["spin_multiplicity"] is None else meta["spin_multiplicity"],
+                        meta["charge"],
+                        meta["spin_multiplicity"],
                         len(symbols),
                         " ".join(symbols),
                         _xyz_block(symbols, target, f"{meta['id']} reference"),

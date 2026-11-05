@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 import importlib.util
 import sys
 from pathlib import Path
@@ -121,8 +120,8 @@ def test_dump_records_the_true_charge_and_spin(bostmc_path, tmp_path) -> None:
         assert row["spin_multiplicity"] == pytest.approx(float(source.loc[key, "spinmult"]))
 
 
-def test_dump_leaves_charge_and_spin_blank_when_the_data_is_silent(qm9_sdf_path, tmp_path) -> None:
-    """An unconditioned dataset must not report a charge it was never given."""
+def test_dump_reports_qm9_as_neutral_singlets(qm9_sdf_path, tmp_path) -> None:
+    """QM9 has no charge or spin columns because every molecule is a neutral singlet."""
     module = _load_script()
     config_path = _write_config(
         tmp_path,
@@ -135,12 +134,10 @@ def test_dump_leaves_charge_and_spin_blank_when_the_data_is_silent(qm9_sdf_path,
     _untrained_checkpoint(tmp_path, conditioned=False)
     module.main(["-c", str(config_path), "--split", "test"])
 
-    with open(tmp_path / "run" / "structures_test.csv") as handle:
-        rows = list(csv.DictReader(handle))
-    assert rows
-    for row in rows:
-        assert row["charge"] == ""
-        assert row["spin_multiplicity"] == ""
+    frame = pd.read_csv(tmp_path / "run" / "structures_test.csv")
+    assert len(frame) > 0
+    assert (frame["charge"] == 0.0).all()
+    assert (frame["spin_multiplicity"] == 1.0).all()
 
 
 def test_predicted_block_is_rigidly_aligned_not_rebuilt(bostmc_path, tmp_path) -> None:

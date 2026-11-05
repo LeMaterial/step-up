@@ -215,13 +215,11 @@ class CSVMoleculeDataset(Dataset):
         return graph
 
     def metadata(self, idx: int) -> dict[str, Any]:
-        """Source-CSV facts about item ``idx``: its id, charge and spin multiplicity.
+        """Id, charge and spin multiplicity of item ``idx``.
 
-        ``charge`` and ``spin_multiplicity`` are ``None`` when the dataset was
-        built without those columns, which is not the same as neutral or
-        closed-shell — it means the CSV does not say. The conditioning collator
-        does default a missing value, so a ``None`` here marks a number the model
-        was handed rather than told.
+        A dataset without a charge column is neutral, and one without a spin
+        column is singlet (QM9 is both; tmQMg is all singlets), the same values
+        the conditioning collator uses.
         """
         real_idx = self._valid_indices[idx]
         row = self._df.iloc[real_idx]
@@ -232,8 +230,8 @@ class CSVMoleculeDataset(Dataset):
         )
         return {
             "id": key,
-            "charge": float(row[self.charge_column]) if self.charge_column else None,
-            "spin_multiplicity": float(row[self.spin_column]) if self.spin_column else None,
+            "charge": float(row[self.charge_column]) if self.charge_column else 0.0,
+            "spin_multiplicity": float(row[self.spin_column]) if self.spin_column else 1.0,
         }
 
     def split_keys(self) -> list[str]:
